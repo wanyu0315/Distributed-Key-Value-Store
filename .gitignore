@@ -1,0 +1,54 @@
+# -----------------------
+# Build and binary files
+# -----------------------
+build/
+bin/
+obj/
+*.o
+*.a
+*.so
+*.out
+*.exe
+
+# -----------------------
+# CMake generated files
+# -----------------------
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+
+# -----------------------
+# IDE and editor settings
+# -----------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*.user
+*.pro.user
+*.vcxproj*
+*.xcodeproj*
+
+# -----------------------
+# Logs and temporary files
+# -----------------------
+*.log
+*.tmp
+*.bak
+*.old
+
+# -----------------------
+# OS-specific files
+# -----------------------
+.DS_Store
+Thumbs.db
+
+# -----------------------
+# Misc
+# -----------------------
+*.zip
+*.tar
+*.gz
+*.7z
