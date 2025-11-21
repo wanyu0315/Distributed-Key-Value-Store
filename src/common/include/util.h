@@ -15,27 +15,97 @@
 #include <random>
 #include <sstream>
 #include <thread>
+#include <chrono>
+#include <atomic>
+#include <memory>
 #include "config.h"
+
+#ifndef KVRAFTCPP_DEFER_H
+#define KVRAFTCPP_DEFER_H
+#include <functional>
+#include <utility>
 
 template <class F>
 class DeferClass {
  public:
-  DeferClass(F&& f) : m_func(std::forward<F>(f)) {}
+  DeferClass(F&& f) : m_func(std::forward<F>(f)), m_dismissed(false) {}  //增加dismissed成员变量，从而取消延迟执行
   DeferClass(const F& f) : m_func(f) {}
-  ~DeferClass() { m_func(); }
+  ~DeferClass() noexcept{    
+    if (!m_dismissed) {
+      m_func(); 
+    }
+  }
 
+// 取消延迟执行函数
+  void dismiss() { m_dismissed = true; }
+
+// 禁用拷贝
   DeferClass(const DeferClass& e) = delete;
   DeferClass& operator=(const DeferClass& e) = delete;
 
+// 支持移动
+  //移动构造函数（创建新对象，直接接管资源，原对象不再执行。）
+  DeferClass(DeferClass&& other) noexcept 
+    : m_func(std::move(other.m_func))
+    , m_dismissed(other.m_dismissed) {
+    other.m_dismissed = true;
+  }
+
+  //移动赋值运算符（将资源从一个对象转移到另一个已存在的对象。）
+  DeferClass& operator=(DeferClass&& other) noexcept {
+    if (this != &other) {
+      if (!m_dismissed) {    //如果当前对象还未取消延迟执行，则先执行它自己的延迟操作，保证语义正确。
+        try {
+          m_func();
+        } catch (...) {}
+      }
+      m_func = std::move(other.m_func);
+      m_dismissed = other.m_dismissed;
+      other.m_dismissed = true;
+    }
+    return *this;
+  }
+
  private:
   F m_func;
+  bool m_dismissed;
 };
 
 #define _CONCAT(a, b) a##b
-#define _MAKE_DEFER_(line) DeferClass _CONCAT(defer_placeholder, line) = [&]()
+#define _MAKE_DEFER_(line) DeferClass _CONCAT(defer, line) = [&]()  // 宏定义lambda表达式,固定使用引用捕获方式
 
 #undef DEFER
-#define DEFER _MAKE_DEFER_(__LINE__)
+#define DEFER _MAKE_DEFER_(__LINE__)  // 宏定义
+
+// 新增有名变量的DEFER宏，方便调用dismiss方法，需要使用者设置变量的生命周期和捕获方式
+#undef DEFER_VAR
+#define DEFER_VAR(name) auto name = Defer  // 展开为：auto x = Defer
+
+#endif  // KVRAFTCPP_DEFER_H
+
+// 使用方法：
+// {
+//     `DEFER { ... }` 实际上是创建了一个匿名的 `DeferClass` 实例。括号里的代码会在该实例析构时执行。
+// void example() {
+//    基本使用：
+//    DEFER { std::cout << "cleanup\n"; };
+
+//    可取消的defer：
+//    DEFER_VAR(d) [&]() { file.close(); };
+//    
+//    // ... do work ...
+//    
+//    if (some_condition) {
+//       d.dismiss();       // 取消 defer
+//    }
+// }
+
+// 改进内容：
+// 1. 添加 noexcept 关键字,以确保在析构中不会抛出异常，防止程序异常终止。
+// 2. 支持取消延迟执行：通过添加 `dismiss()` 方法，可以在需要时取消延迟执行的代码块。
+// 3. 新增有名变量的DEFER宏，方便调用dismiss方法，此宏在创建实例时需要使用者设置变量的生命周期和捕获方式。
+// 4. 支持移动语义：通过实现移动构造函数和移动赋值运算符，允许 `Defer` 对象被移动，而不会导致多次执行延迟代码块。
+
 
 void DPrintf(const char* format, ...);
 
@@ -53,61 +123,249 @@ std::string format(const char* format_str, Args... args) {
 
 std::chrono::_V2::system_clock::time_point now();
 
-std::chrono::milliseconds getRandomizedElectionTimeout();
+std::chrono::milliseconds getRandomizedElectionTimeout(); //返回一个随机的选举超时时间
 void sleepNMilliseconds(int N);
 
 // ////////////////////////异步写日志的日志队列
 // read is blocking!!! LIKE  go chan
 template <typename T>
 class LockQueue {
- public:
-  // 多个worker线程都会写日志queue
-  void Push(const T& data) {
-    std::lock_guard<std::mutex> lock(m_mutex);  //使用lock_gurad，即RAII的思想保证锁正确释放
-    m_queue.push(data);
-    m_condvariable.notify_one();
-  }
-
-  // 一个线程读日志queue，写日志文件
-  T Pop() {
-    std::unique_lock<std::mutex> lock(m_mutex);
-    while (m_queue.empty()) {
-      // 日志队列为空，线程进入wait状态
-      m_condvariable.wait(lock);  //这里用unique_lock是因为lock_guard不支持解锁，而unique_lock支持
-    }
-    T data = m_queue.front();
-    m_queue.pop();
-    return data;
-  }
-
-  bool timeOutPop(int timeout, T* ResData)  // 添加一个超时时间参数，默认为 50 毫秒
-  {
-    std::unique_lock<std::mutex> lock(m_mutex);
-
-    // 获取当前时间点，并计算出超时时刻
-    auto now = std::chrono::system_clock::now();
-    auto timeout_time = now + std::chrono::milliseconds(timeout);
-
-    // 在超时之前，不断检查队列是否为空
-    while (m_queue.empty()) {
-      // 如果已经超时了，就返回一个空对象
-      if (m_condvariable.wait_until(lock, timeout_time) == std::cv_status::timeout) {
-        return false;
-      } else {
-        continue;
-      }
+public:
+    // 构造函数:支持设置最大容量
+    explicit LockQueue(size_t max_capacity = 0) 
+        : m_max_capacity(max_capacity), m_is_shutdown(false) {}
+    
+    // 禁止拷贝和赋值
+    LockQueue(const LockQueue&) = delete;
+    LockQueue& operator=(const LockQueue&) = delete;
+    
+    // 析构函数:确保优雅关闭
+    ~LockQueue() {
+        Shutdown();
     }
 
-    T data = m_queue.front();
-    m_queue.pop();
-    *ResData = data;
-    return true;
-  }
+    // 1. 改进的Push - 支持移动语义和容量限制
+    bool Push(T&& data) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        
+        // 等待队列有空间(如果设置了容量限制)
+        if (m_max_capacity > 0) {
+            m_not_full.wait(lock, [this] {
+                return m_queue.size() < m_max_capacity || m_is_shutdown;
+            });
+        }
+        
+        //检测关闭状态
+        if (m_is_shutdown) {
+            return false;
+        }
+        
+        m_queue.push(std::move(data));
+        m_not_empty.notify_one();
+        return true;
+    }
+    
+    // 拷贝版本的Push(兼容性)
+    bool Push(const T& data) {
+        T temp(data);
+        return Push(std::move(temp));
+    }
+    
+    // 2. 超时Push - 避免生产者永久阻塞
+    bool timeOutPush(T&& data, int timeout_ms) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        
+        if (m_max_capacity > 0) {
+            auto timeout_time = std::chrono::steady_clock::now() + 
+                               std::chrono::milliseconds(timeout_ms);
+            
+            if (!m_not_full.wait_until(lock, timeout_time, [this] {
+                return m_queue.size() < m_max_capacity || m_is_shutdown;
+            })) {
+                return false;  // 超时
+            }
+        }
+        
+        if (m_is_shutdown) {
+            return false;
+        }
+        
+        m_queue.push(std::move(data));
+        m_not_empty.notify_one();
+        return true;
+    }
 
- private:
-  std::queue<T> m_queue;
-  std::mutex m_mutex;
-  std::condition_variable m_condvariable;
+    // 3. 批量Push - 减少锁竞争次数
+    bool PushBatch(std::vector<T>&& items) {
+        if (items.empty()) return true;
+        
+        std::unique_lock<std::mutex> lock(m_mutex);
+        
+        if (m_max_capacity > 0) {
+            m_not_full.wait(lock, [this, &items] {
+                return m_queue.size() + items.size() <= m_max_capacity || m_is_shutdown;
+            });
+        }
+        
+        if (m_is_shutdown) {
+            return false;
+        }
+        
+        for (auto& item : items) {
+            m_queue.push(std::move(item));
+        }
+        
+        // 如果有多个等待线程,唤醒多个
+        if (items.size() > 1) {
+            m_not_empty.notify_all();
+        } else {
+            m_not_empty.notify_one();
+        }
+        return true;
+    }
+
+    // 4. 改进的Pop - 使用输出参数避免拷贝,增加异常安全性
+    bool Pop(T& out_data) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        
+        m_not_empty.wait(lock, [this] {
+            return !m_queue.empty() || m_is_shutdown;
+        });
+        
+        if (m_is_shutdown && m_queue.empty()) {
+            return false;
+        }
+        
+        // 使用移动语义,异常安全
+        out_data = std::move(m_queue.front());   //把队首元素移动给输出参数out_data
+        m_queue.pop();
+        
+        if (m_max_capacity > 0) {
+            m_not_full.notify_one();
+        }
+        
+        return true;
+    }
+
+    // 5. 改进的超时Pop
+    bool timeOutPop(int timeout_ms, T& out_data) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        
+        // 获取当前时间点，并计算出超时时刻
+        auto timeout_time = std::chrono::steady_clock::now() + 
+                           std::chrono::milliseconds(timeout_ms);
+        
+        if (!m_not_empty.wait_until(lock, timeout_time, [this] {
+            return !m_queue.empty() || m_is_shutdown;
+        })) {
+            return false;  // 超时
+        }
+        
+        if (m_is_shutdown && m_queue.empty()) {
+            return false;
+        }
+        
+        out_data = std::move(m_queue.front());
+        m_queue.pop();
+        
+        if (m_max_capacity > 0) {
+            m_not_full.notify_one();
+        }
+        
+        return true;
+    }
+
+    // 6. 批量Pop - 提高吞吐量
+    size_t PopBatch(std::vector<T>& out_items, size_t max_count) {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        
+        m_not_empty.wait(lock, [this] {
+            return !m_queue.empty() || m_is_shutdown;
+        });
+        
+        if (m_is_shutdown && m_queue.empty()) {
+            return 0;
+        }
+        
+        size_t count = 0;
+        while (!m_queue.empty() && count < max_count) {
+            out_items.push_back(std::move(m_queue.front()));
+            m_queue.pop();
+            ++count;
+        }
+        
+        if (m_max_capacity > 0 && count > 0) {
+            m_not_full.notify_all();
+        }
+        
+        return count;
+    }
+
+    // 7. 非阻塞尝试Pop
+    bool TryPop(T& out_data) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        
+        if (m_queue.empty()) {
+            return false;
+        }
+        
+        out_data = std::move(m_queue.front());
+        m_queue.pop();
+        
+        if (m_max_capacity > 0) {
+            m_not_full.notify_one();
+        }
+        
+        return true;
+    }
+
+    // 8. 状态查询接口
+    size_t Size() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.size();
+    }
+    
+    bool Empty() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_queue.empty();
+    }
+    
+    bool IsFull() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_max_capacity > 0 && m_queue.size() >= m_max_capacity;
+    }
+
+    // 9. 优雅关闭机制
+    void Shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_is_shutdown = true;
+        }
+        // 唤醒所有等待的线程
+        m_not_empty.notify_all();
+        m_not_full.notify_all();
+    }
+    //判断是否已关闭
+    bool IsShutdown() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_is_shutdown;
+    }
+
+    // 10. 清空队列
+    void Clear() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::queue<T> empty_queue;
+        std::swap(m_queue, empty_queue);
+        m_not_full.notify_all();
+    }
+
+private:
+    std::queue<T> m_queue;
+    mutable std::mutex m_mutex;
+    std::condition_variable m_not_empty;   // 队列非空条件变量
+    std::condition_variable m_not_full;    // 队列未满条件变量
+    size_t m_max_capacity;                  // 最大容量(0表示无限制)
+    bool m_is_shutdown;                     // 关闭标志
 };
 // 两个对锁的管理用到了RAII的思想，防止中途出现问题而导致资源无法释放的问题！！！
 // std::lock_guard 和 std::unique_lock 都是 C++11 中用来管理互斥锁的工具类，它们都封装了 RAII（Resource Acquisition Is
@@ -136,7 +394,8 @@ class Op {
   // todo
   //为了协调raftRPC中的command只设置成了string,这个的限制就是正常字符中不能包含|
   //当然后期可以换成更高级的序列化方法，比如protobuf
-  std::string asString() const {
+
+  std::string asString() const {      // Op 对象序列化为 std::string（用于 RPC 传输或写入日志）。
     std::stringstream ss;
     boost::archive::text_oarchive oa(ss);
 
@@ -147,13 +406,22 @@ class Op {
     return ss.str();
   }
 
+  // 反序列化（添加try...catch 块，防止崩溃）
   bool parseFromString(std::string str) {
-    std::stringstream iss(str);
-    boost::archive::text_iarchive ia(iss);
-    // read class state from archive
-    ia >> *this;
-    return true;  // todo : 解析失敗如何處理，要看一下boost庫了
-  }
+    try {
+        std::stringstream iss(str);
+        boost::archive::text_iarchive ia(iss);
+        // read class state from archive
+        ia >> *this;
+        return true; 
+    } catch (const std::exception& e) {
+        // 当 str 格式错误时，Boost.Serialization 会抛出异常
+        // 我们捕获它，并返回 false，而不是让程序崩溃
+        // 你可以在这里用 DPrintf 打印日志
+        // DPrintf("Op::parseFromString failed: %s", e.what());
+        return false;
+    }
+}
 
  public:
   friend std::ostream& operator<<(std::ostream& os, const Op& obj) {

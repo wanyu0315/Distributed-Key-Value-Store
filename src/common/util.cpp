@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <ctime>
 #include <iomanip>
+#include <random> // 确保 <random> 被包含
 
 void myAssert(bool condition, std::string message) {
   if (!condition) {
@@ -15,11 +16,17 @@ void myAssert(bool condition, std::string message) {
 std::chrono::_V2::system_clock::time_point now() { return std::chrono::high_resolution_clock::now(); }
 
 std::chrono::milliseconds getRandomizedElectionTimeout() {
-  std::random_device rd;
-  std::mt19937 rng(rd());
-  std::uniform_int_distribution<int> dist(minRandomizedElectionTime, maxRandomizedElectionTime);
+    //创建一个线程局部的、只播种一次的伪随机数引擎
+    thread_local static std::mt19937 rng(std::random_device{}());
 
-  return std::chrono::milliseconds(dist(rng));
+    // 创建一个线程局部的、只初始化一次的分布
+    thread_local static std::uniform_int_distribution<int> dist(
+        minRandomizedElectionTime, 
+        maxRandomizedElectionTime
+    );
+
+    // 生成并返回随机的选举超时时间
+    return std::chrono::milliseconds(dist(rng));
 }
 
 void sleepNMilliseconds(int N) { std::this_thread::sleep_for(std::chrono::milliseconds(N)); };

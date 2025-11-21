@@ -1,2 +1,2 @@
-add_subdirectory(src/common)
-add_subdirectory(src/skipList)
+add_subdirectory(common)
+add_subdirectory(skipList)
