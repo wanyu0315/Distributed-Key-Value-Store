@@ -6,13 +6,22 @@ cmake_minimum_required(VERSION 3.16)
 # 2. 定义项目名称
 project(MyDistributedStore CXX)
 
-# 3. 设置C++标准 (例如 C++17)
+# 3. 启用测试功能
+enable_testing()
+
+# 4. 设置C++标准 (例如 C++17)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# 4. 告诉CMake进入 "src" 目录
-add_subdirectory(src)
+# 5. 查找外部库或包
+find_package(Boost REQUIRED COMPONENTS serialization system)  #  使用 Boost 库的序列化和系统组件
+find_package(Threads REQUIRED) # 查找线程库 (pthread)
+find_package(Protobuf REQUIRED) # 查找 Protobuf 库
 
-# 5. 告诉 CMake 加载我们的测试程序 (假设 'test' 目录在根目录)
-#    (如果 'test' 目录在 'src' 下面，请改为 add_subdirectory(src/test) )
-add_subdirectory(test)
+# 6. 告诉CMake进入各个子目录
+add_subdirectory(src)
+add_subdirectory(test)  # (如果 'test' 目录在 'src' 下面，请改为 add_subdirectory(src/test) )
+add_subdirectory(proto)
+
+
+

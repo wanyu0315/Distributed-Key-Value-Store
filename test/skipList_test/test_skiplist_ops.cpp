@@ -90,8 +90,8 @@ void TestConcurrency() {
     std::cout << "[Test 3] Concurrency Sanity Check (Readers + Writer)... ";
 
     SkipList<int, int> list(12);
-    int num_elements = 1000;
-    int num_readers = 4;
+    int num_elements = 1000;    //写入元素数量
+    int num_readers = 4;    //读进程数量
     std::atomic<bool> done{false};
 
     // 预先填充一些数据
