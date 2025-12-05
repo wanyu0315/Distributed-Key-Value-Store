@@ -1,0 +1,10 @@
+syntax = "proto3";
+package test;
+option cc_generic_services = true; // 必须开启，生成 Service 类
+
+message TestRequest { string msg = 1; }
+message TestResponse { string msg = 1; }
+
+service TestService {
+    rpc TestMethod(TestRequest) returns(TestResponse);
+}
