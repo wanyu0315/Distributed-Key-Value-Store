@@ -227,7 +227,7 @@ void RpcProvider::OnConnection(const muduo::net::TcpConnectionPtr& conn) {
     // 2. 创建连接上下文，记录活跃时间
     auto ctx = std::make_shared<ConnectionContext>();
     ctx->conn = conn;
-    ctx->last_active_time = muduo::Timestamp::now();
+    ctx->last_active_time = muduo::Timestamp::now(); // 初始化时间戳
 
     {
       std::lock_guard<std::mutex> lock(conn_mutex_);
@@ -345,7 +345,7 @@ bool RpcProvider::TryParseMessage(muduo::net::Buffer* buffer,
   // buffer->peek() 是起始位置，偏移 varint_size 就是 Header 的开始
   const char* header_start = buffer->peek() + varint_size;
   
-  // 构造临时的 string 用于反序列化
+  // 使用收到的二进制数据流拷贝构造临时的 string ，用于反序列化
   std::string rpc_header_str(header_start, header_size);
   
   RPC::RpcHeader rpc_header;
@@ -363,7 +363,8 @@ bool RpcProvider::TryParseMessage(muduo::net::Buffer* buffer,
   // 校验 args 长度
   if (args_size > config_.max_message_size) {
     LOG_ERROR << "Args size too large: " << args_size;
-    buffer->retrieve(total_header_len); // 消费已读
+    // 长度异常，消费掉已读取的部分，抛出异常断开连接
+    buffer->retrieve(total_header_len); 
     throw std::runtime_error("Message too large");
   }
 
@@ -446,7 +447,8 @@ void RpcProvider::HandleRpcRequest(const muduo::net::TcpConnectionPtr& conn,
   // 注意：response.get() 传给回调，response.release() 放弃所有权，防止被提前析构
   auto response_ptr = response.get();
   
-  // NewCallback 创建的 Closure 会在 Run 被调用时执行 SendRpcResponse
+  //  绑定回调闭包 (Closure)
+  // 相当于构造一个回调函数：当业务做完后，请调用 this->SendRpcResponse
   google::protobuf::Closure* done = google::protobuf::NewCallback(
       this, &RpcProvider::SendRpcResponse, conn, response_ptr);
 
@@ -477,12 +479,12 @@ void RpcProvider::SendRpcResponse(muduo::net::TcpConnectionPtr conn,
   {
     google::protobuf::io::StringOutputStream string_output(&frame);
     google::protobuf::io::CodedOutputStream coded_output(&string_output);
-    coded_output.WriteVarint32(response_str.size());
+    coded_output.WriteVarint32(response_str.size()); // 写入长度
     // CodedOutputStream 析构时会 flush 到 frame
   }
-  frame.append(response_str);
+  frame.append(response_str); // 追加数据data部分
 
-  conn->send(frame);
+  conn->send(frame); // 发送的是frame
   LOG_DEBUG << "Response sent: " << response_str.size() << " bytes";
 }
 

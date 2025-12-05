@@ -96,6 +96,8 @@ class RpcProvider {
   const Metrics& GetMetrics() const { return metrics_; }
 
  private:
+  //测试类是我的朋友，允许它访问我的私有成员
+  friend class RpcProviderTester;
   // 服务信息结构体 (注册表项)
   struct ServiceInfo {
     google::protobuf::Service* service; // 服务对象基类指针
@@ -197,6 +199,7 @@ class RpcProvider {
   // 从管理表中移除连接
   void RemoveConnection(const std::string& conn_name);
 
+protected:
   // 获取本机非回环 IP 地址
   std::string GetLocalIP() const;
   

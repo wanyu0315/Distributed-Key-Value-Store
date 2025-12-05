@@ -19,9 +19,10 @@ find_package(Threads REQUIRED) # 查找线程库 (pthread)
 find_package(Protobuf REQUIRED) # 查找 Protobuf 库
 
 # 6. 告诉CMake进入各个子目录
+add_subdirectory(proto)
 add_subdirectory(src)
 add_subdirectory(test)  # (如果 'test' 目录在 'src' 下面，请改为 add_subdirectory(src/test) )
-add_subdirectory(proto)
+
 
 
 
