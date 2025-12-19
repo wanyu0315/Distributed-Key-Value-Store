@@ -16,7 +16,7 @@ target_include_directories(test_proto_lib PUBLIC ${CMAKE_CURRENT_BINARY_DIR})
 add_executable(rpc_config_test test_rpc_config.cpp)
 target_link_libraries(rpc_config_test 
     PRIVATE 
-    rpc_provider_lib # 你的 rpcprovider 库目标名
+    rpc_lib # 你的 rpcprovider 库目标名
 )
 add_test(NAME RpcConfigTest COMMAND rpc_config_test)
 
@@ -24,7 +24,7 @@ add_test(NAME RpcConfigTest COMMAND rpc_config_test)
 add_executable(rpc_registry_test test_rpc_registry.cpp)
 target_link_libraries(rpc_registry_test
     PRIVATE
-    rpc_provider_lib # rpcprovider 库
+    rpc_lib # rpcprovider 库
     test_proto_lib  # 测试服务的 protobuf 库
 )
 
@@ -32,5 +32,5 @@ target_link_libraries(rpc_registry_test
 add_executable(rpc_protocol_test test_rpc_protocol.cpp)
 target_link_libraries(rpc_protocol_test
     PRIVATE
-    rpc_provider_lib # rpcprovider 库
+    rpc_lib # rpcprovider 库
 )

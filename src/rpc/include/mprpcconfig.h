@@ -15,6 +15,11 @@ public:
     // 参数: config_file 配置文件路径
     void LoadConfigFile(const char *config_file);
 
+    // 加载环境变量 (进阶：用于 Docker/K8s)
+    // prefix: 环境变量的前缀，例如 "RPC_"
+    // 作用: 将 RPC_SERVER_IP 转换为 server.ip 并存入 map
+    void LoadEnvVariables(const std::string &prefix);
+
     // 查询配置项 - 返回字符串
     // key: 配置项名称 (如果是section下的，格式为 "section.key")
     std::string Load(const std::string &key);

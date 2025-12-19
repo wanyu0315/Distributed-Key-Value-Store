@@ -120,3 +120,44 @@ void MprpcConfig::Trim(std::string &src_buf) {
     // 截取中间有效部分
     src_buf = src_buf.substr(first, (last - first + 1));
 }
+
+// 加载环境变量
+void MprpcConfig::LoadEnvVariables(const std::string &prefix) {
+    // 声明外部全局变量，指向环境变量表
+    extern char **environ;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // 遍历所有环境变量
+    for (char **env = environ; *env != nullptr; ++env) {
+        std::string env_str = *env;
+        
+        // 查找等号位置
+        size_t pos = env_str.find('=');
+        if (pos == std::string::npos) continue;
+
+        std::string env_key = env_str.substr(0, pos);
+        std::string env_value = env_str.substr(pos + 1);
+
+        // 1. 检查前缀 (例如只处理 RPC_ 开头的变量)
+        if (env_key.size() > prefix.size() && env_key.substr(0, prefix.size()) == prefix) {
+            
+            // 2. 键名转换逻辑
+            // 原始: RPC_RPCSERVER_PORT
+            // 去前缀: RPCSERVER_PORT
+            std::string config_key = env_key.substr(prefix.size());
+            
+            // 转小写: rpcserver_port
+            std::transform(config_key.begin(), config_key.end(), config_key.begin(), ::tolower);
+            
+            // 下划线变点: rpcserver.port
+            std::replace(config_key.begin(), config_key.end(), '_', '.');
+
+            // 3. 存入/覆盖 Map
+            m_configMap[config_key] = env_value;
+
+            // 调试日志
+            // std::cout << "[Config] Env Loaded: " << env_key << " -> " << config_key << " = " << env_value << std::endl;
+        }
+    }
+}
