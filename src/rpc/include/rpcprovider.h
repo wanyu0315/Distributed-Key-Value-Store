@@ -53,7 +53,7 @@ class RpcProvider {
     int idle_timeout_seconds = 300;  
     
     bool enable_metrics = true; // 是否开启指标统计
-    std::string log_level = "INFO";
+    // std::string log_level = "INFO";
   };
 
   // 构造函数：传入配置，初始化 Environment
@@ -92,6 +92,7 @@ class RpcProvider {
     std::atomic<uint64_t> failed_requests{0};    // 失败请求数
     std::atomic<uint64_t> active_connections{0}; // 当前活跃连接数
     std::atomic<uint64_t> partial_messages{0};   // 发生的半包/粘包次数
+    std::atomic<int> pending_requests{0};       // 当前正在处理的请求数
   };
   const Metrics& GetMetrics() const { return metrics_; }
 
@@ -114,6 +115,9 @@ class RpcProvider {
 
   // 配置信息
   Config config_;
+
+  // Hook ID，用于注册和注销生命周期钩子
+  int shutdown_hook_id_ = -1;  
 
   // Muduo 网络库核心组件
   muduo::net::EventLoop event_loop_;          // 主事件循环
@@ -164,7 +168,8 @@ class RpcProvider {
                        uint32_t& header_size,
                        std::string& service_name,
                        std::string& method_name,
-                       std::string& args_str);
+                       std::string& args_str,
+                       uint64_t& request_id);
 
   /**
    * @brief 执行 RPC 业务逻辑
@@ -177,14 +182,16 @@ class RpcProvider {
   void HandleRpcRequest(const muduo::net::TcpConnectionPtr& conn,
                         const std::string& service_name,
                         const std::string& method_name,
-                        const std::string& args_str);
+                        const std::string& args_str,
+                        uint64_t request_id);
 
   // ================= 响应发送区 =================
 
   // 发送正常响应 (由 Closure 回调触发)
   // 会自动序列化 response 并添加长度头
   void SendRpcResponse(muduo::net::TcpConnectionPtr conn,
-                       google::protobuf::Message* response);
+                       google::protobuf::Message* response,
+                       uint64_t request_id);
   
   // 发送错误响应 (如解析失败、服务未找到)
   void SendErrorResponse(const muduo::net::TcpConnectionPtr& conn,

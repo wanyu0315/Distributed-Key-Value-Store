@@ -78,7 +78,7 @@ void MprpcConfig::LoadConfigFile(const char *config_file) {
 }
 
 // 查询配置项信息 (String)
-std::string MprpcConfig::Load(const std::string &key) {
+std::string MprpcConfig::Load(const std::string &key) const {
     std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_configMap.find(key);
     if (it == m_configMap.end()) {
@@ -88,7 +88,7 @@ std::string MprpcConfig::Load(const std::string &key) {
 }
 
 // 查询配置项信息 (Int) - 这是一个非常实用的辅助函数
-int MprpcConfig::LoadInt(const std::string &key, int default_value) {
+int MprpcConfig::LoadInt(const std::string &key, int default_value) const {
     std::string val_str = Load(key);
     if (val_str.empty()) {
         return default_value;
@@ -122,11 +122,11 @@ void MprpcConfig::Trim(std::string &src_buf) {
 }
 
 // 加载环境变量
-void MprpcConfig::LoadEnvVariables(const std::string &prefix) {
+void MprpcConfig::LoadEnvVariables(const std::string &prefix) { // prefix用于限定可被加载的环境变量范围
     // 声明外部全局变量，指向环境变量表
     extern char **environ;
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::lock_guard<std::mutex> lock(m_mutex); // 保护 m_configMap
 
     // 遍历所有环境变量
     for (char **env = environ; *env != nullptr; ++env) {

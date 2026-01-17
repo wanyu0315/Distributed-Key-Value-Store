@@ -1,5 +1,7 @@
 #include "rpcclient.h"
 #include "rpcheader.pb.h" 
+#include "mprpcapplication.h" 
+#include "zookeeperutil.h"    
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -11,6 +13,7 @@
 #include <cstring>
 #include <algorithm>
 #include <iostream>
+#include <atomic>
 
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl.h>
@@ -99,7 +102,8 @@ bool RpcConnection::Connect() {
     // 1. 创建 socket（创建的是一个socket描述符）
     int client_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (client_fd == -1) {
-        std::cerr << "[Conn-" << id_ << "] socket() failed: " << strerror(errno) << std::endl;
+        LOG_ERROR("[Conn-{}] socket() failed: {}", id_, strerror(errno));
+        // std::cerr << "[Conn-" << id_ << "] socket() failed: " << strerror(errno) << std::endl;
         return false;
     }
 
@@ -118,7 +122,9 @@ bool RpcConnection::Connect() {
     
     // 非阻塞 connect 会立即返回 -1，errno 为 EINPROGRESS
     if (ret == -1 && errno != EINPROGRESS) {
-        std::cerr << "[Conn-" << id_ << "] connect() failed: " << strerror(errno) << std::endl;
+
+        LOG_ERROR("[Conn-{}] connect() failed: {}", id_, strerror(errno));
+        // std::cerr << "[Conn-" << id_ << "] connect() failed: " << strerror(errno) << std::endl;
         close(client_fd);
         return false;
     }
@@ -138,7 +144,8 @@ bool RpcConnection::Connect() {
         ret = select(client_fd + 1, nullptr, &write_fds, nullptr, &timeout);
 
         if (ret <= 0) {
-            std::cerr << "[Conn-" << id_ << "] connect timeout/error" << std::endl;
+            LOG_ERROR("[Conn-{}] connect timeout/error", id_);
+            // std::cerr << "[Conn-" << id_ << "] connect timeout/error" << std::endl;
             close(client_fd);
             return false;
         }
@@ -147,7 +154,8 @@ bool RpcConnection::Connect() {
         int error = 0;
         socklen_t len = sizeof(error);
         if (getsockopt(client_fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0 || error != 0) {
-            std::cerr << "[Conn-" << id_ << "] connect socket error: " << strerror(error) << std::endl;
+            LOG_ERROR("[Conn-{}] connect socket error: {}", id_, strerror(error));
+            // std::cerr << "[Conn-" << id_ << "] connect socket error: " << strerror(error) << std::endl;
             close(client_fd);
             return false;
         }
@@ -164,7 +172,8 @@ bool RpcConnection::Connect() {
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)); // 设置发送超时
 
     fd_ = client_fd;
-    std::cout << "[Conn-" << id_ << "] Connected to " << ip_ << ":" << port_ << std::endl;
+    LOG_INFO("[Conn-{}] Connected to {}:{}", id_, ip_, port_);
+    // std::cout << "[Conn-" << id_ << "] Connected to " << ip_ << ":" << port_ << std::endl;
     return true;
 }
 
@@ -267,12 +276,26 @@ bool RpcConnection::SendRequest(uint64_t request_id,
  * @details
  * 【并发化修改】：这是新增的函数。
  * 以前的接收是在 CallMethod 中同步调用的，现在每个连接启动一个独立的 std::thread 进行接收。
+ * 解决了并发重复启动导致的崩溃问题
  */
-void RpcConnection::StartReceiveThread(
-    std::function<void(uint64_t, int32_t, const std::string&, const std::string&)> callback) {
+void RpcConnection::StartReceiveThread(std::function<void(uint64_t, int32_t, const std::string&, const std::string&)> callback) {
+    std::lock_guard<std::mutex> lock(thread_start_mutex_);  // 加锁防止多线程同时启动
+
+    // 如果已经在运行，直接返回，不做任何操作
+    // 这让后续拿到该连接的线程可以直接复用已有的接收线程
+    if (thread_is_running_) {
+        LOG_INFO("[Conn-{}] Receive thread already running, can be reused", id_);
+        return;
+    }
+
     response_callback_ = callback; // 绑定回调，连接层只负责收字节，收齐了就通过这个回调扔给 Channel 去处理业务。
     stop_recv_thread_ = false;
     recv_thread_ = std::thread([this]() { ReceiveLoop(); }); // 启动线程：std::thread 启动，执行 ReceiveLoop
+
+    // 标记为已运行
+    thread_is_running_ = true;
+
+    LOG_INFO("[Conn-{}] Receive thread first started.", id_);
 }
 
 void RpcConnection::StopReceiveThread() {
@@ -280,6 +303,9 @@ void RpcConnection::StopReceiveThread() {
     if (recv_thread_.joinable()) {
         recv_thread_.join();
     }
+
+    std::lock_guard<std::mutex> lock(thread_start_mutex_);
+    thread_is_running_ = false;
 }
 
 /**
@@ -295,7 +321,8 @@ void RpcConnection::ReceiveLoop() {
         // 1. 读取数据 (复用逻辑)
         if (!ReadToBuffer()) {
             if (!stop_recv_thread_) {
-                std::cerr << "[Conn-" << id_ << "] Connection closed/error, waiting for retry..." << std::endl;
+                LOG_ERROR("[Conn-{}] Connection closed/error, waiting for retry...", id_);
+                // std::cerr << "[Conn-" << id_ << "] Connection closed/error, waiting for retry..." << std::endl;
                 Close();
                 // 简单重试等待，防止 CPU 空转
                 std::this_thread::sleep_for(std::chrono::seconds(1)); 
@@ -319,14 +346,16 @@ void RpcConnection::ReceiveLoop() {
             }
             catch (const std::exception& e) {
                 // 捕获标准异常 (如 bad_alloc, runtime_error)
-                std::cerr << "[Conn-" << id_ << "] CRITICAL EXCEPTION in parser: " << e.what() << std::endl;
+                LOG_ERROR("[Conn-{}] CRITICAL EXCEPTION in parser: {}", id_, e.what());
+                // std::cerr << "[Conn-" << id_ << "] CRITICAL EXCEPTION in parser: " << e.what() << std::endl;
                 // 发生异常通常意味着内存错乱或协议严重破坏，必须断开连接
                 Close(); 
                 return; // 直接退出线程，防止死循环或二次崩溃
             }
             catch (...) {
                 // 捕获未知异常
-                std::cerr << "[Conn-" << id_ << "] UNKNOWN EXCEPTION in parser." << std::endl;
+                LOG_ERROR("[Conn-{}] UNKNOWN EXCEPTION in parser.", id_);
+                // std::cerr << "[Conn-" << id_ << "] UNKNOWN EXCEPTION in parser." << std::endl;
                 Close();
                 return;
             }
@@ -341,7 +370,8 @@ void RpcConnection::ReceiveLoop() {
             }
         }
     }
-    std::cout << "[Conn-" << id_ << "] Receive thread exited." << std::endl;
+    LOG_INFO("[Conn-{}] Receive thread exited.", id_);
+
 }
 
 /**
@@ -366,7 +396,8 @@ bool RpcConnection::ReadToBuffer() {
         } 
         else if (n == 0) {
             // 2. 对端关闭连接 (FIN)
-            std::cerr << "[Conn-" << id_ << "] Connection closed by peer." << std::endl;
+            LOG_ERROR("[Conn-{}] Connection closed by peer.", id_);
+            // std::cerr << "[Conn-" << id_ << "] Connection closed by peer." << std::endl;
             return false; // 返回 false 通知调用者断开连接
         } 
         else {
@@ -379,7 +410,8 @@ bool RpcConnection::ReadToBuffer() {
                 return true; 
             } else {
                 // 3.2 真正的 socket 错误 (如 Connection Reset)
-                std::cerr << "[Conn-" << id_ << "] Recv error: " << strerror(errno) << std::endl;
+                LOG_ERROR("[Conn-{}] Recv error: {}", id_, strerror(errno));
+                // std::cerr << "[Conn-" << id_ << "] Recv error: " << strerror(errno) << std::endl;
                 return false; // 返回 false 通知调用者断开连接
             }
         }
@@ -407,7 +439,7 @@ bool RpcConnection::TryParseResponse(uint64_t& request_id, int32_t& error_code,
 
   // 校验 header 大小（防止恶意大包）
   if (header_size == 0 || header_size > config_.max_message_size) {
-    std::cerr << "[TryParseResponse] Invalid header size: " << header_size << std::endl;
+    LOG_ERROR("[Conn-{}] Invalid header size: {}", id_, header_size);
     // 丢弃损坏的数据
     recv_buffer_.erase(0, varint_size);
     throw std::runtime_error("Invalid response header size");
@@ -427,7 +459,7 @@ bool RpcConnection::TryParseResponse(uint64_t& request_id, int32_t& error_code,
 
   RPC::RpcHeader rpc_header;
   if (!rpc_header.ParseFromString(header_str)) {
-    std::cerr << "[TryParseResponse] Failed to parse RPC header" << std::endl;
+    LOG_ERROR("[Conn-{}] Failed to parse RPC header", id_);
     recv_buffer_.erase(0, offset);
     throw std::runtime_error("Invalid RPC header");
   }
@@ -440,7 +472,7 @@ bool RpcConnection::TryParseResponse(uint64_t& request_id, int32_t& error_code,
 
   // 校验 args_size
   if (args_size > config_.max_message_size) {
-    std::cerr << "[TryParseResponse] Args size too large: " << args_size << std::endl;
+    LOG_ERROR("[Conn-{}] Args size too large: {}", id_, args_size);
     recv_buffer_.erase(0, offset);
     throw std::runtime_error("Response too large");
   }
@@ -487,12 +519,16 @@ ConnectionPool::~ConnectionPool() {
  * @details 创建指定数量的 RpcConnection 并尝试连接。
  */
 bool ConnectionPool::Init() {
+    LOG_INFO("[ConnPool] Initializing connection pool to {}:{} with {} connections.",
+             ip_, port_, config_.connection_pool_size);
     for (int i = 0; i < config_.connection_pool_size; ++i) {
         auto conn = std::make_shared<RpcConnection>(i, ip_, port_, config_);    // 创建N个连接对象实例
         if (!conn->Connect()) {
-            std::cerr << "[ConnPool] Warn: Failed to connect " << i << ", will retry later." << std::endl;
+            LOG_ERROR("[ConnPool] Warn: Failed to connect {}, will retry later.", i);
+            // std::cerr << "[ConnPool] Warn: Failed to connect " << i << ", will retry later." << std::endl;
             // 策略：即使部分连接失败也继续初始化，允许后续重连
         }
+        LOG_INFO("[ConnPool] Successfully created connection {}", i);
         connections_.push_back(conn); // 创建的连接加入连接池（一个 vector 里）
     }
     return true;
@@ -512,52 +548,102 @@ std::shared_ptr<RpcConnection> ConnectionPool::GetConnection() {
 
 // 打印连接池中每个连接的统计信息
 void ConnectionPool::PrintStats() const {
-    std::cout << "\n========== Connection Pool Stats ==========" << std::endl;
+    LOG_INFO("========== Connection Pool Stats ==========");
     for (const auto& conn : connections_) {
-        std::cout << "Conn-" << conn->GetId() 
-                  << " | Requests: " << conn->GetTotalRequests()
-                  << " | Failed: " << conn->GetFailedRequests() << std::endl;
+        LOG_INFO("Conn-{} | Requests: {} | Failed: {}",
+                 conn->GetId(), conn->GetTotalRequests(), conn->GetFailedRequests());
     }
-    std::cout << "==========================================\n" << std::endl;
+    LOG_INFO("==========================================");
 }
 
 // ============================================================================
 // [类 MprpcChannel] 实现 (核心入口)
 // ============================================================================
 
+// 全局连接池 Map，用于缓存不同 IP:Port 的连接池
+// Key: "127.0.0.1:8000"
+static std::map<std::string, std::shared_ptr<ConnectionPool>> g_conn_pools;
+static std::mutex g_pools_mutex;
+// 初始化静态成员
+std::unordered_map<uint64_t, std::shared_ptr<PendingRpcContext>> MprpcChannel::pending_requests_;
+std::mutex MprpcChannel::pending_mutex_;
+
+// 构造函数不再强制初始化单个 IP 的 Pool，而是作为 RPCClient 启动器
+// ip 和 port 参数现在可以传空，或者用于直连模式
 MprpcChannel::MprpcChannel(const std::string& ip, uint16_t port,
                            const RpcClientConfig& config)
     : ip_(ip), port_(port), config_(config) {
-    
-    // 1. 初始化连接池
-    conn_pool_ = std::make_unique<ConnectionPool>(ip, port, config);
-    conn_pool_->Init();
 
-    // 2. 启动接收线程
-    // 【并发化修改】：这里使用简单的 Hack 方式，循环调用 GetConnection 来覆盖所有连接。
-    // 实际工程中建议 ConnectionPool 提供 ForEach 接口。
-    // 我们给每个连接注册同一个回调函数：MprpcChannel::OnResponseReceived
-    for(int i = 0; i < config.connection_pool_size * 2; ++i) { 
-        auto conn = conn_pool_->GetConnection();
-        // StartReceiveThread 内部会启动线程，用于监听该连接的响应
-        conn->StartReceiveThread([this](uint64_t req_id, int32_t err, const std::string& msg, const std::string& data) {
-            this->OnResponseReceived(req_id, err, msg, data);
-        });
+    // 1. 如果构造时指定了 IP，则初始化直连池
+    if (!ip_.empty() && port_ != 0) {
+        conn_pool_ = std::make_unique<ConnectionPool>(ip, port, config);
+        conn_pool_->Init();
+        
+        // 这里使用简单的 Hack 方式，循环调用 GetConnection 来覆盖所有连接。
+        // 给每个连接注册同一个回调函数：MprpcChannel::OnResponseReceived
+        for(int i = 0; i < config.connection_pool_size * 2; ++i) { 
+            auto conn = conn_pool_->GetConnection();
+            // 启动接受线程
+            conn->StartReceiveThread([this](uint64_t req_id, int32_t err, const std::string& msg, const std::string& data) {
+                this->OnResponseReceived(req_id, err, msg, data);
+            });
+        }
     }
 
     // 3. 启动超时检查后台线程
     stop_timeout_checker_ = false;
     timeout_checker_thread_ = std::thread([this]() { TimeoutCheckerLoop(); });
+
+    // =======================================================================
+    // 注册优雅关闭钩子 Hook
+    // =======================================================================
+    // 防止程序被 kill 时，析构函数没执行，导致线程没 join
+    shutdown_hook_id_ = MprpcApplication::GetInstance().RegisterShutdownHook([this]() {
+        LOG_INFO("[MprpcChannel] Shutdown hook triggered.");
+        this->Shutdown(); // 调用提取出来的 Shutdown 方法
+    });
 }
 
 MprpcChannel::~MprpcChannel() {
-    // 停止超时检查线程
-    stop_timeout_checker_ = true;
-    if (timeout_checker_thread_.joinable()) {
-        timeout_checker_thread_.join();
+    // 注销钩子 & 执行关闭
+    // 如果对象是提前正常析构的，必须把钩子摘掉，否则 App 退出时会回调野指针
+    if (shutdown_hook_id_ >= 0) {
+        LOG_INFO("[MprpcChannel] 在MprpcApplication之前析构，注销钩子避免野指针.");
+        MprpcApplication::GetInstance().UnregisterShutdownHook(shutdown_hook_id_);
     }
-    // conn_pool_ 智能指针自动析构 -> Connection 析构 -> 停止接收线程
-    conn_pool_.reset();
+    
+    Shutdown(); // 复用关闭逻辑
+
+    // 注意：g_conn_pools 是全局的，这里不清除，以便其他 Channel 复用连接
+    // 如果需要清理，可以在程序退出时统一清理
+}
+
+/**
+* @brief 优雅关闭
+* 停止超时检查线程，停止所有连接池的线程
+*/
+void MprpcChannel::Shutdown() {
+    LOG_INFO("[MprpcChannel] Shutting down...");
+    
+    // 1. 停止超时检查线程
+    if (!stop_timeout_checker_) { // 简单的状态检查，防止重复 join
+        stop_timeout_checker_ = true;
+        if (timeout_checker_thread_.joinable()) {
+            timeout_checker_thread_.join();
+        }
+    }
+
+    // 2. 停止所有连接池的线程
+    // 注意：g_conn_pools 是全局的，通常由程序退出时统一清理。
+    // 但如果是直连模式的 conn_pool_ (unique_ptr)，它会随着 MprpcChannel 析构自动释放
+    // ConnectionPool 的析构函数里已经调用了 StopReceiveThread。
+    // 所以这里主要处理属于自己的线程资源。
+    
+    if (conn_pool_) {
+        // 显式停止，虽然 unique_ptr 析构也会做，但这样更安全
+        // conn_pool_.reset(); // 或者什么都不做，依赖析构
+    }
+    LOG_INFO("[MprpcChannel] MprpcChannel Shutdown 完毕");
 }
 
 /**
@@ -572,14 +658,65 @@ MprpcChannel::~MprpcChannel() {
  * - 新逻辑：Send -> `cv.wait_for`(挂起等待信号) -> Return
  * - 信号由 IO 线程在 `OnResponseReceived` 中触发。
  * 4. **异步支持**：如果 `done != nullptr`，发送完直接返回，不阻塞。
+ * 5. 引入 ZK 服务发现
  */
 void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
                               google::protobuf::RpcController* controller,
                               const google::protobuf::Message* request,
                               google::protobuf::Message* response,
                               google::protobuf::Closure* done) {
+    // 获取服务名和方法名
     std::string service_name = method->service()->name();
     std::string method_name = method->name();
+
+    // -------------------------------------------------------------
+    // ZooKeeper 服务发现逻辑
+    // -------------------------------------------------------------
+    std::string target_ip = ip_;
+    uint16_t target_port = port_;
+
+    // 如果没有指定直连 IP，则通过 ZK 查询
+    if (target_ip.empty()) {
+        ZkClient& zk = ZkClient::GetInstance();
+        // 确保 RPC 客户端的 ZK 客户端已启动
+        if (!zk.IsConnected()) {
+            ZkConfig zk_conf;
+            zk_conf.host = MprpcApplication::GetInstance().GetConfig().Load("zookeeper_ip");    // 从配置文件获取 ZK 服务器地址
+            zk_conf.host += ":" + MprpcApplication::GetInstance().GetConfig().Load("zookeeper_port"); // 追加端口
+            zk_conf.root_path = "/mprpc";
+            zk.Init(zk_conf);  
+            zk.Start(); // 启动 ZK 客户端连接
+        }
+
+        // 获取远程 Zk 服务端中service_name这个服务的的服务列表
+        std::vector<std::string> hosts = zk.GetServiceList(service_name);
+        if (hosts.empty()) {
+            controller->SetFailed("No service provider found for: " + service_name);
+            if (done) done->Run();
+            return;
+        }
+
+        // 轮询负载均衡算法：选择一个提供 server_name 服务的 IP:Port
+        // 使用静态原子变量，确保多线程安全且不需要修改类成员
+        // 每次请求到来，索引加 1
+        static std::atomic_uint load_balance_idx{0};
+        
+        // 取模运算，确保索引落在 hosts 范围内
+        int idx = load_balance_idx.fetch_add(1) % hosts.size();
+        
+        std::string host_data = hosts[idx]; // 获取选中的节点
+
+        // =============================================================
+
+        size_t split = host_data.find(':');
+        if (split == std::string::npos) {
+            controller->SetFailed("Invalid host address from ZK: " + host_data);
+            return;
+        }
+        target_ip = host_data.substr(0, split);  // 服务实例的IP
+        target_port = atoi(host_data.substr(split + 1).c_str());   // 服务实例的Port
+    }
+
     // 生成全局唯一的 Request ID
     uint64_t request_id = GenerateRequestId();
 
@@ -593,8 +730,48 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
 
     RegisterPendingRequest(request_id, ctx);
 
-    // 从池中获取连接
-    auto conn = conn_pool_->GetConnection();
+    // 获取或创建对应的连接池
+    std::shared_ptr<RpcConnection> conn;
+    // 如果是直连模式 (构造函数传了IP)，直接用成员变量 conn_pool_
+    if (!ip_.empty()) {
+        conn = conn_pool_->GetConnection();
+    } else {
+        // 否则使用动态全局池
+        std::string host_key = target_ip + ":" + std::to_string(target_port); // 能够提供该服务的实例IP:Port
+        std::shared_ptr<ConnectionPool> pool;
+        
+        {
+            std::lock_guard<std::mutex> lock(g_pools_mutex);
+            auto it = g_conn_pools.find(host_key);  // 全局名册 (`g_conn_pools`)是否已经有该 IP 的连接池
+            if (it == g_conn_pools.end()) {
+                // 首次连接该 IP，创建新池
+                pool = std::make_shared<ConnectionPool>(target_ip, target_port, config_);
+                pool->Init();
+                // 必须为新池中的连接绑定当前 Channel 的回调
+                // 注意：这里会有个小问题，如果多个 Channel 实例共用一个全局池，回调给谁？
+                // 这里的 Hack 方案是：每个连接接收到数据时，根据 request_id 在 Global Map 中找 Context。
+                // 但目前的 PendingMap 是成员变量。
+                // ----------------------------------------------------
+                // 修正：为了支持 ZK 动态连接且不破坏现有的成员变量结构，
+                // 我们在这里暂时只支持 "每个目标 IP 创建一个临时连接" 或 "为该 Channel 独享该池"。
+                // 考虑到高并发代码的复杂性，这里我们采用【从池中取出连接，并动态绑定回调】的策略
+                // ----------------------------------------------------
+                
+                // 为了简化，这里我们暂时只对新池做初始化，回调绑定在 GetConnection 后做
+                g_conn_pools[host_key] = pool;
+            } else {
+                pool = it->second;
+            }
+        }
+        conn = pool->GetConnection();   // 从全局池中借出一个连接
+        
+        // 这是一个轻量级操作，因为 StartReceiveThread 内部只是赋值 callback
+        // 选中的TCP连接开启接受线程
+        conn->StartReceiveThread([](uint64_t req_id, int32_t err, const std::string& msg, const std::string& data) {
+            MprpcChannel::OnResponseReceived(req_id, err, msg, data); // 绑定到静态回调函数，以便找到对应的 Channel 实例
+        });
+    }
+
     if (!conn || !conn->IsConnected()) {
         // 简单的重连尝试
         if (conn && !conn->IsConnected()) {
@@ -674,11 +851,11 @@ void MprpcChannel::OnResponseReceived(uint64_t request_id, int32_t error_code,
         }
     }
 
-    // 唤醒同步等待线程，无论CallMethod中选择同步等待还是异步回调都会执行唤醒，只不过异步回调时会空响而言
+    // 唤醒同步等待的线程，无论CallMethod中选择同步等待还是异步回调都会执行唤醒，只不过异步回调时会空响而已
     {
         std::lock_guard<std::mutex> lock(ctx->mutex);
         ctx->finished = true;
-        ctx->cv.notify_one();
+        ctx->cv.notify_one();   // <--- 这一行代码向当初发起这个请求的 rpcChannel 线程发出了信号！
     }
 
     // 执行异步回调，转到上层业务层执行回调函数（同步调用时 done 为空，不需要回调函数）

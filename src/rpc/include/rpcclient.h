@@ -17,6 +17,8 @@
 #include <string>
 #include <functional>
 #include <chrono>
+#include "rpccontroller.h"
+#include "zookeeperutil.h"   
 
 // ============================================================================
 // 配置结构体
@@ -27,7 +29,7 @@ struct RpcClientConfig {
   int max_retry_times = 3;            // 最大重试次数
   int max_message_size = 10 * 1024 * 1024;  // 最大消息 10MB
 
-    // 新增：连接池配置
+    // 连接池配置
   int connection_pool_size = 4;        // 连接池大小（建议 = CPU 核数）
   int io_thread_pool_size = 2;         // IO 线程数（接收线程）
 
@@ -98,6 +100,8 @@ private:
     std::mutex send_mutex_;      // 保护发送操作
     std::string recv_buffer_;    // 接收缓冲区
     std::mutex recv_mutex_;      // 保护接收缓冲区
+    std::mutex thread_start_mutex_;     // 防止多线程同时启动的锁
+    bool thread_is_running_ = false;    // 记录是否已经启动的状态
 
     std::thread recv_thread_;
     std::atomic<bool> stop_recv_thread_{false};
@@ -143,6 +147,12 @@ public:
                  const RpcClientConfig& config = RpcClientConfig());
     ~MprpcChannel();
 
+    /**
+    * @brief 优雅关闭
+    * 停止超时检查线程，停止所有连接池的线程
+    */
+    void Shutdown();
+
     // 禁用拷贝
     MprpcChannel(const MprpcChannel&) = delete;
     MprpcChannel& operator=(const MprpcChannel&) = delete;
@@ -163,9 +173,11 @@ private:
 
     std::unique_ptr<ConnectionPool> conn_pool_;
 
+    int shutdown_hook_id_{-1}; // 优雅关闭钩子 ID
+
     std::atomic<uint64_t> next_request_id_{1};
-    std::mutex pending_mutex_;
-    std::unordered_map<uint64_t, std::shared_ptr<PendingRpcContext>> pending_requests_;
+    static std::mutex pending_mutex_;
+    static std::unordered_map<uint64_t, std::shared_ptr<PendingRpcContext>> pending_requests_;
 
     std::thread timeout_checker_thread_;
     std::atomic<bool> stop_timeout_checker_{false};
@@ -175,7 +187,7 @@ private:
     void RegisterPendingRequest(uint64_t request_id, 
                                 std::shared_ptr<PendingRpcContext> ctx);
     
-    void OnResponseReceived(uint64_t request_id, int32_t error_code,
+    static void OnResponseReceived(uint64_t request_id, int32_t error_code,
                             const std::string& error_msg,
                             const std::string& response_data);
     

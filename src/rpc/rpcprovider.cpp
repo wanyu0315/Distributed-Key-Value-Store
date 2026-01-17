@@ -1,4 +1,6 @@
 #include "rpcprovider.h"
+#include "mprpcapplication.h" 
+#include "zookeeperutil.h"    
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -11,6 +13,27 @@
 #include "google/protobuf/io/coded_stream.h"
 #include "google/protobuf/io/zero_copy_stream_impl.h"
 #include "rpcheader.pb.h"
+
+// ===========================================================================
+// 辅助类：用于将 C++11 Lambda 转换为 google::protobuf::Closure
+// ==========================================================================
+class RpcClosure : public google::protobuf::Closure {
+public:
+    using Callback = std::function<void()>;
+
+    explicit RpcClosure(Callback cb) : cb_(cb) {}
+
+    // 重写 Run 方法
+    void Run() override {
+        if (cb_) {
+            cb_();
+        }
+        delete this; // 关键：Run 执行完后，必须自杀 (delete this)，这是 Protobuf Closure 的规矩
+    }
+
+private:
+    Callback cb_;
+};
 
 // ===========================================================================
 // 辅助工具：TCP 拆包核心逻辑
@@ -48,48 +71,54 @@ RpcProvider::RpcProvider(const Config& config)
   
   // 1. 配置校验：防止因参数错误导致服务启动后行为异常
   if (!ValidateConfig()) {
-    LOG_FATAL << "Invalid RPC provider configuration";
+    LOG_CRITICAL("Invalid RPC provider configuration");
+    exit(EXIT_FAILURE);
   }
 
   // 2. 日志级别设置：根据配置动态调整，方便调试 vs 生产环境切换
-  // 用户可以在配置文件中设置不同的日志级别控制框架输出多少日志
-  if (config_.log_level == "DEBUG") {
-    muduo::Logger::setLogLevel(muduo::Logger::DEBUG);
-  } else if (config_.log_level == "INFO") {
-    muduo::Logger::setLogLevel(muduo::Logger::INFO);
-  } else if (config_.log_level == "WARN") {
-    muduo::Logger::setLogLevel(muduo::Logger::WARN);
-  } else if (config_.log_level == "ERROR") {
-    muduo::Logger::setLogLevel(muduo::Logger::ERROR);
-  }
+  // 日志系统已经在 MprpcApplication::Init 中初始化完成了
+  // if (config_.log_level == "DEBUG") {
+  //   muduo::Logger::setLogLevel(muduo::Logger::DEBUG);
+  // } else if (config_.log_level == "INFO") {
+  //   muduo::Logger::setLogLevel(muduo::Logger::INFO);
+  // } else if (config_.log_level == "WARN") {
+  //   muduo::Logger::setLogLevel(muduo::Logger::WARN);
+  // } else if (config_.log_level == "ERROR") {
+  //   muduo::Logger::setLogLevel(muduo::Logger::ERROR);
+  // }
 
-  LOG_INFO << "RpcProvider initialized: ip=" << config_.ip
-           << ", port=" << config_.port
-           << ", threads=" << config_.thread_num
-           << ", max_msg_size=" << config_.max_message_size;
+  LOG_INFO("RpcProvider initialized: ip={}, port={}, threads={}, max_msg_size={}", 
+             config_.ip, 
+             config_.port, 
+             config_.thread_num, 
+             config_.max_message_size);
 }
 
 RpcProvider::~RpcProvider() {
+  // 取消注册 Hook（防止野指针）
+  if (shutdown_hook_id_ != -1) { // 意味着 Hook 成功注册了。
+    MprpcApplication::GetInstance().UnregisterShutdownHook(shutdown_hook_id_);
+  }
   Shutdown(); // 析构时确保资源释放
 }
 
 // 校验逻辑：确保rpc服务启动时候所有来自配置文件的参数在合理范围内
 bool RpcProvider::ValidateConfig() const {
   if (config_.port == 0) {
-    LOG_ERROR << "Invalid port: " << config_.port;
+    LOG_ERROR("Invalid port: {}", config_.port);
     return false;
   }
   if (config_.thread_num <= 0 || config_.thread_num > 64) {
-    LOG_ERROR << "Invalid thread_num: " << config_.thread_num;
+    LOG_ERROR("Invalid thread_num: {}", config_.thread_num);
     return false;
   }
   if (config_.max_connections <= 0) {
-    LOG_ERROR << "Invalid max_connections: " << config_.max_connections;
+    LOG_ERROR("Invalid max_connections: {}", config_.max_connections);
     return false;
   }
   // 限制最大包大小（例如1GB），防止恶意的大包攻击导致 OOM (内存耗尽)
   if (config_.max_message_size <= 0 || config_.max_message_size > 1024*1024*1024) {
-    LOG_ERROR << "Invalid max_message_size: " << config_.max_message_size;
+    LOG_ERROR("Invalid max_message_size: {}", config_.max_message_size);
     return false;
   }
   return true;
@@ -103,8 +132,44 @@ void RpcProvider::Shutdown() {
     return;
   }
 
-  LOG_INFO << "RpcProvider shutting down...";
+  LOG_INFO("RpcProvider shutting down...");
 
+  // -----------------------------------------------------------------------
+  // 第一步：ZK 下线 (通知客户端)
+  // -----------------------------------------------------------------------
+  // 必须最先做！断开 ZK Session，临时节点立即消失。
+  // 客户端监听到节点消失，就不会再向本节点发新请求了。
+  LOG_INFO("[Shutdown Step 1] Unregistering from Zookeeper...");
+  ZkClient::GetInstance().Stop();
+
+  // -----------------------------------------------------------------------
+  // 第二步：等待正在进行的请求处理完毕
+  // -----------------------------------------------------------------------
+  // 这是一个策略选择。
+  // 简单做法：设置一个标志位，让正在运行的 HandleRpcRequest 知道要停了
+  // 进阶做法：等待 pending_requests 归零 (需加超时机制，防止死等)
+
+  LOG_INFO("[Shutdown Step 2] Waiting for pending requests...");
+
+  // 简单倒计时等待（例如最多等 3 秒）
+  int retries = 0;
+  while (metrics_.pending_requests > 0 && retries < 30) {
+      usleep(100000); // 睡 100ms
+      retries++;
+      if (retries % 10 == 0) {
+          LOG_INFO("Waiting for {} pending requests...", metrics_.pending_requests);
+      }
+  }
+  
+  if (metrics_.pending_requests > 0) {
+      LOG_WARN("Timeout! Forcing shutdown with {} active requests.", metrics_.pending_requests);
+  } else {
+      LOG_INFO("All requests finished.");
+  }
+
+  // -----------------------------------------------------------------------
+  // 第三步：断开所有连接
+  // -----------------------------------------------------------------------
   {
     std::lock_guard<std::mutex> lock(conn_mutex_);
     for (auto& pair : connections_) {
@@ -116,16 +181,17 @@ void RpcProvider::Shutdown() {
     connections_.clear();
   }
 
-  // 退出 EventLoop
+  // 最后退出 EventLoop
   if (event_loop_.eventHandling()) {
     event_loop_.quit();
   }
 
   // 打印最终统计信息
-  LOG_INFO << "RpcProvider shutdown complete. Stats - "
-           << "Total: " << metrics_.total_requests
-           << ", Failed: " << metrics_.failed_requests
-           << ", Partial: " << metrics_.partial_messages;
+  LOG_INFO("RpcProvider shutdown complete. Stats - "
+           "Total: {}, Failed: {}, Partial: {}",
+           metrics_.total_requests,
+           metrics_.failed_requests,
+           metrics_.partial_messages);
 }
 
 // 服务注册：利用 Protobuf 反射机制构建路由表，是服务器自己将自己的支持的服务进行注册，依据是自己规定的业务.proto文件
@@ -133,7 +199,7 @@ void RpcProvider::Shutdown() {
 bool RpcProvider::NotifyService(google::protobuf::Service* service) {
   //如果传入的service指针为空，则记录错误日志并返回false，表示注册失败。
   if (!service) {
-    LOG_ERROR << "Null service pointer";
+    LOG_ERROR("Null service pointer");
     return false;
   }
 
@@ -146,7 +212,7 @@ bool RpcProvider::NotifyService(google::protobuf::Service* service) {
   
   //检查服务是否已注册
   if (service_map_.find(service_name) != service_map_.end()) {
-    LOG_WARN << "Service already registered: " << service_name;
+    LOG_WARN("Service already registered: {}", service_name);
     return false;
   }
 
@@ -159,19 +225,18 @@ bool RpcProvider::NotifyService(google::protobuf::Service* service) {
     const google::protobuf::MethodDescriptor* method_desc = service_desc->method(i);
     std::string method_name = method_desc->name();
     service_info.method_map[method_name] = method_desc;
-    LOG_INFO << "Registered method: " << service_name << "." << method_name;
+    LOG_INFO("Registered method: {}.{},", service_name, method_name);
   }
 
   service_map_[service_name] = service_info;
-  LOG_INFO << "Service registered: " << service_name
-           << " with " << method_count << " methods";
+  LOG_INFO("Service registered: {} with {} methods", service_name, method_count);
   return true;
 }
 
 // 初始化底层网络库（Muduo），绑定业务逻辑回调，启动事件循环。执行函数后，服务器将正式开始监听端口，等待客户端连接和请求
 void RpcProvider::Run() {
   if (shutdown_flag_) {
-    LOG_WARN << "RpcProvider already shutdown, cannot run";
+    LOG_WARN("RpcProvider already shutdown, cannot run");
     return;
   }
 
@@ -179,6 +244,9 @@ void RpcProvider::Run() {
   if (ip.empty()) {
     ip = GetLocalIP(); // 自动获取本机 IP
   }
+
+  // 更新配置中的 IP，确保注册到 ZK 的是真实 IP
+  config_.ip = ip;
 
   muduo::net::InetAddress address(ip, config_.port);
   
@@ -206,10 +274,52 @@ void RpcProvider::Run() {
     event_loop_.runEvery(30.0, [this]() { CheckIdleConnections(); });
   }
 
-  LOG_INFO << "RpcProvider starting at " << ip << ":" << config_.port
-           << " with " << config_.thread_num << " threads";
+  LOG_INFO("RpcProvider starting at {}:{} with {} threads", ip, config_.port, config_.thread_num);
 
+  // 注册到 MprpcApplication 的生命周期管理
+  int hook_id = MprpcApplication::GetInstance().RegisterShutdownHook([this]() {
+    LOG_INFO("MprpcApplication triggered shutdown, stopping RpcProvider...");
+    this->Shutdown();  // 当收到信号时，自动调用 Shutdown
+  });
+
+  // 保存 hook_id，以便析构时取消注册（可选）
+  shutdown_hook_id_ = hook_id;
+  
   server_->start();   // 此时端口才真正打开，可以接收 TCP 握手
+
+  //========================================================
+  //连接 ZK 并注册服务
+  //========================================================
+  ZkConfig zk_conf;    // ZKClient 配置结构体，用于初始化ZkClient单例
+  zk_conf.host = MprpcApplication::GetInstance().GetConfig().Load("zookeeper_ip");  // 从配置文件获取 ZK 服务器地址
+  zk_conf.host += ":" + MprpcApplication::GetInstance().GetConfig().Load("zookeeper_port");  // 追加端口
+  zk_conf.session_timeout_ms = 30000;
+  zk_conf.root_path = "/mprpc"; // Zk 服务端的默认rpc根路径 
+
+  // 启动 rpc 服务端的 zk 客户端单例
+  ZkClient& zk_cli = ZkClient::GetInstance();
+  zk_cli.Init(zk_conf);
+  
+  if (zk_cli.Start()) {
+      // 遍历所有已加载的 Service，注册到 ZK
+      // 路径格式: /mprpc/ServiceName/ip:port
+      for (auto& sp : service_map_) {
+          std::string service_name = sp.first;
+          std::string service_path = service_name;
+          std::string service_addr = ip + ":" + std::to_string(config_.port); // rpc服务端IP:Port = 办理服务的IP:Port
+          
+          // 注册服务（创建临时节点）
+          if (zk_cli.RegisterService(service_name, service_addr)) { // 此函数最终创建出/mprpc/ServiceName/ip:port临时节点
+              LOG_INFO("Successfully registered service to ZK: {} -> {}", service_name, service_addr);
+          } else {
+              LOG_ERROR("Failed to register service to ZK: {}", service_name);
+          }
+      }
+  } else {
+      LOG_ERROR("Failed to start ZkClient, services will not be discoverable!");
+  }
+
+  LOG_INFO("RpcProvider enter event loop...");
   event_loop_.loop(); // 进入事件循环，阻塞在此，通过 `epoll_wait` 等待网络事件发生
 }
 
@@ -218,8 +328,7 @@ void RpcProvider::OnConnection(const muduo::net::TcpConnectionPtr& conn) {
   if (conn->connected()) {
     // 1. 连接限制检查
     if (metrics_.active_connections >= config_.max_connections) {
-      LOG_WARN << "Max connections reached, rejecting: " 
-               << conn->peerAddress().toIpPort();
+      LOG_WARN("Max connections reached, rejecting: {}", conn->peerAddress().toIpPort());
       conn->shutdown();
       return;
     }
@@ -235,14 +344,12 @@ void RpcProvider::OnConnection(const muduo::net::TcpConnectionPtr& conn) {
     }
 
     metrics_.active_connections++;
-    LOG_INFO << "Connection established: " << conn->peerAddress().toIpPort()
-             << ", active: " << metrics_.active_connections;
+    LOG_INFO("Connection established: {} , active: {}", conn->peerAddress().toIpPort(), metrics_.active_connections);
   } else {
     // 连接断开，清理上下文
     RemoveConnection(conn->name());
     metrics_.active_connections--;
-    LOG_INFO << "Connection closed: " << conn->peerAddress().toIpPort()
-             << ", active: " << metrics_.active_connections;
+    LOG_INFO("Connection closed: {} , active: {}", conn->peerAddress().toIpPort(), metrics_.active_connections);
   }
 }
 
@@ -264,30 +371,34 @@ void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr& conn,
   // 如果收到半个包，循环会因 TryParseMessage 返回 false 而终止
   while (true) {
     uint32_t header_size = 0;
+    uint64_t request_id = 0;  // <--- 定义请求ID变量
     std::string service_name, method_name, args_str;
 
     // 尝试解析一个完整的消息
     // 返回 true 表示成功解析了一个包，buffer 指针已后移
     // 返回 false 表示数据不够（半包），buffer 指针未动，等待下次数据到来
     bool parsed = TryParseMessage(buffer, header_size, 
-                                  service_name, method_name, args_str);
+                                  service_name, method_name, args_str, request_id);
     
     if (!parsed) {
       // 半包：数据不够，退出循环，等待 TCP 继续传输
       metrics_.partial_messages++;
       // Debug log, 生产环境可降低级别
-      LOG_DEBUG << "Partial message received, waiting for more data. "
-                << "Buffer size: " << buffer->readableBytes();
+      LOG_DEBUG("Partial message received, waiting for more data. "
+                "Buffer size: {}", buffer->readableBytes());
       break; 
     }
 
     // 3. 完整包解析成功，开始业务处理
     metrics_.total_requests++;
+
+    // 正在处理的请求计数 +1
+    metrics_.pending_requests++;
     
     try {
-      HandleRpcRequest(conn, service_name, method_name, args_str);
+      HandleRpcRequest(conn, service_name, method_name, args_str, request_id);
     } catch (const std::exception& e) {
-      LOG_ERROR << "Exception handling RPC request: " << e.what();
+      LOG_ERROR("Exception handling RPC request: {}", e.what());
       SendErrorResponse(conn, RPC_INTERNAL_ERROR, e.what());
       metrics_.failed_requests++;
     }
@@ -309,7 +420,8 @@ bool RpcProvider::TryParseMessage(muduo::net::Buffer* buffer,
                                   uint32_t& header_size,
                                   std::string& service_name,
                                   std::string& method_name,
-                                  std::string& args_str) {
+                                  std::string& args_str,
+                                  uint64_t& request_id) {
   // ==========================================================
   // 阶段 1: 偷看 (Peek) 头部长度
   // ==========================================================
@@ -322,7 +434,7 @@ bool RpcProvider::TryParseMessage(muduo::net::Buffer* buffer,
 
   // 校验 header 长度合法性
   if (header_size == 0 || header_size > config_.max_message_size) {
-    LOG_ERROR << "Invalid header size: " << header_size;
+    LOG_ERROR("Invalid header size: {}", header_size);
     // 这种情况下，数据已经损坏，必须丢弃或断开。
     // 为了防止死循环，我们 retrieve 掉这个坏的 varint，并抛出异常让外层断开连接
     buffer->retrieve(varint_size); 
@@ -350,19 +462,21 @@ bool RpcProvider::TryParseMessage(muduo::net::Buffer* buffer,
   
   RPC::RpcHeader rpc_header;
   if (!rpc_header.ParseFromString(rpc_header_str)) {
-    LOG_ERROR << "Failed to parse RPC header";
+    LOG_ERROR("Failed to parse RPC header");
     // 协议错乱，消费掉已读取的部分，抛出异常断开连接
     buffer->retrieve(total_header_len);
     throw std::runtime_error("Invalid RPC header");
   }
 
+  // ... 解析 Header ...
   service_name = rpc_header.service_name();
   method_name = rpc_header.method_name();
   uint32_t args_size = rpc_header.args_size();
+  request_id = rpc_header.request_id(); // <--- 提取请求ID
 
   // 校验 args 长度
   if (args_size > config_.max_message_size) {
-    LOG_ERROR << "Args size too large: " << args_size;
+    LOG_ERROR("Args size too large: {}", args_size);
     // 长度异常，消费掉已读取的部分，抛出异常断开连接
     buffer->retrieve(total_header_len); 
     throw std::runtime_error("Message too large");
@@ -393,9 +507,7 @@ bool RpcProvider::TryParseMessage(muduo::net::Buffer* buffer,
   // 此时 Buffer 的 readerIndex 已经指向了 Args 的开头
   args_str = buffer->retrieveAsString(args_size);
 
-  LOG_DEBUG << "Parsed complete message: " << service_name 
-            << "." << method_name 
-            << ", args size: " << args_size;
+  LOG_DEBUG("Parsed complete message: {} . {}, args size: {}", service_name, method_name, args_size);
 
   return true;
 }
@@ -404,7 +516,8 @@ bool RpcProvider::TryParseMessage(muduo::net::Buffer* buffer,
 void RpcProvider::HandleRpcRequest(const muduo::net::TcpConnectionPtr& conn,
                                    const std::string& service_name,
                                    const std::string& method_name,
-                                   const std::string& args_str) {
+                                   const std::string& args_str,
+                                   uint64_t request_id) {
   // 1. 查找服务和方法
   google::protobuf::Service* service = nullptr;
   const google::protobuf::MethodDescriptor* method = nullptr;
@@ -414,14 +527,14 @@ void RpcProvider::HandleRpcRequest(const muduo::net::TcpConnectionPtr& conn,
     
     auto service_it = service_map_.find(service_name);
     if (service_it == service_map_.end()) {
-      LOG_WARN << "Service not found: " << service_name;
+      LOG_WARN("Service not found: {}", service_name);
       SendErrorResponse(conn, RPC_SERVICE_NOT_FOUND, "Service not found: " + service_name);
       return;
     }
 
     auto method_it = service_it->second.method_map.find(method_name);
     if (method_it == service_it->second.method_map.end()) {
-      LOG_WARN << "Method not found: " << service_name << "." << method_name;
+      LOG_WARN("Method not found: {} . {}", service_name, method_name);
       SendErrorResponse(conn, RPC_METHOD_NOT_FOUND, "Method not found: " + method_name);
       return;
     }
@@ -438,7 +551,7 @@ void RpcProvider::HandleRpcRequest(const muduo::net::TcpConnectionPtr& conn,
 
   // 3. 反序列化请求参数
   if (!request->ParseFromString(args_str)) {
-    LOG_ERROR << "Failed to parse request arguments";
+    LOG_ERROR("Failed to parse request arguments");
     SendErrorResponse(conn, RPC_INVALID_REQUEST, "Failed to parse request arguments");
     return;
   }
@@ -449,8 +562,12 @@ void RpcProvider::HandleRpcRequest(const muduo::net::TcpConnectionPtr& conn,
   
   //  绑定回调闭包 (Closure)
   // 相当于构造一个回调函数：当业务做完后，请调用 this->SendRpcResponse
-  google::protobuf::Closure* done = google::protobuf::NewCallback(
-      this, &RpcProvider::SendRpcResponse, conn, response_ptr);
+  // 利用 Lambda 捕获 this, conn, response_ptr, request_id，这样无论有多少个参数都能传进去
+  google::protobuf::Closure* done = new RpcClosure([this, conn, response_ptr, request_id]() {
+        this->SendRpcResponse(conn, response_ptr, request_id);
+    });
+  // google::protobuf::Closure* done = google::protobuf::NewCallback(
+  //     this, &RpcProvider::SendRpcResponse, conn, response_ptr, request_id);
 
   // 5. 执行业务逻辑
   // 这一步会跳转到 RaftService 的实现代码中
@@ -462,30 +579,43 @@ void RpcProvider::HandleRpcRequest(const muduo::net::TcpConnectionPtr& conn,
 
 // 发送响应：添加长度头
 void RpcProvider::SendRpcResponse(muduo::net::TcpConnectionPtr conn,
-                                  google::protobuf::Message* response) {
+                                  google::protobuf::Message* response,
+                                  uint64_t request_id) {
   // 接管 response 所有权，确保函数结束时自动 delete，防止内存泄漏
   std::unique_ptr<google::protobuf::Message> response_guard(response);
 
   std::string response_str;
   if (!response->SerializeToString(&response_str)) {
-    LOG_ERROR << "Failed to serialize response";
+    LOG_ERROR("Failed to serialize response");
     SendErrorResponse(conn, RPC_INTERNAL_ERROR, "Failed to serialize response");
     return;
   }
 
-  // 构造带长度头的帧：[varint32: size] + [data]
+  // 构造 RpcHeader，设置 request_id
+  RPC::RpcHeader rpc_header;
+  rpc_header.set_request_id(request_id); // 客户端靠这个 ID 知道是哪个请求的响应
+  rpc_header.set_error_code(0);
+  rpc_header.set_args_size(response_str.size());
+
+  std::string header_str;
+  rpc_header.SerializeToString(&header_str);
+
+  // 构造带长度头的帧：[Varint: header_len] + [Header] + [Body]
   // 客户端收到后，也必须先读 varint 长度，再读 data
   std::string frame;
   {
     google::protobuf::io::StringOutputStream string_output(&frame);
     google::protobuf::io::CodedOutputStream coded_output(&string_output);
-    coded_output.WriteVarint32(response_str.size()); // 写入长度
+    coded_output.WriteVarint32(header_str.size()); // 写入 header 长度
     // CodedOutputStream 析构时会 flush 到 frame
   }
-  frame.append(response_str); // 追加数据data部分
+  frame.append(header_str); // 追加 header 部分
+  frame.append(response_str); // 追加 body 部分
 
   conn->send(frame); // 发送的是frame
-  LOG_DEBUG << "Response sent: " << response_str.size() << " bytes";
+
+  metrics_.pending_requests--; // 响应发送完毕，正在处理的请求结束，计数 -1
+  LOG_DEBUG("Response sent: id={}, bytes={}", request_id, frame.size());
 }
 
 // 发送错误响应（用于协议错误或系统错误）
@@ -507,7 +637,10 @@ void RpcProvider::SendErrorResponse(const muduo::net::TcpConnectionPtr& conn,
   frame.append(error_str);
   
   conn->send(frame);
-  LOG_WARN << "Error response: code=" << error_code << ", msg=" << error_msg;
+
+  // 错误响应发送完毕，请求结束，计数 -1
+  metrics_.pending_requests--;
+  LOG_WARN("Error response: code={}, msg={}", error_code, error_msg);
 }
 
 // 检查空闲连接
@@ -537,8 +670,8 @@ void RpcProvider::CheckIdleConnections() {
     std::lock_guard<std::mutex> lock(conn_mutex_);
     auto it = connections_.find(conn_name);
     if (it != connections_.end() && it->second->conn) {
-      LOG_INFO << "Closing idle connection: " 
-               << it->second->conn->peerAddress().toIpPort();
+      LOG_INFO("Closing idle connection: {}",
+               it->second->conn->peerAddress().toIpPort());
       it->second->conn->shutdown();
     }
   }
@@ -553,13 +686,13 @@ void RpcProvider::RemoveConnection(const std::string& conn_name) {
 std::string RpcProvider::GetLocalIP() const {
   char hostname[256];
   if (gethostname(hostname, sizeof(hostname)) != 0) {
-    LOG_ERROR << "gethostname failed";
+    LOG_ERROR("gethostname failed");
     return "127.0.0.1";
   }
 
   struct hostent* host = gethostbyname(hostname);
   if (!host || !host->h_addr_list[0]) {
-    LOG_ERROR << "gethostbyname failed";
+    LOG_ERROR("gethostbyname failed");
     return "127.0.0.1";
   }
 
@@ -567,7 +700,7 @@ std::string RpcProvider::GetLocalIP() const {
   for (int i = 0; host->h_addr_list[i]; ++i) {
     char* ip = inet_ntoa(*(struct in_addr*)(host->h_addr_list[i]));
     if (ip && strncmp(ip, "127.", 4) != 0) {
-      LOG_INFO << "Detected local IP: " << ip;
+      LOG_INFO("Detected local IP: {}", ip);
       return std::string(ip);
     }
   }

@@ -22,10 +22,10 @@ public:
 
     // 查询配置项 - 返回字符串
     // key: 配置项名称 (如果是section下的，格式为 "section.key")
-    std::string Load(const std::string &key);
+    std::string Load(const std::string &key) const;
 
     // 查询配置项 - 返回整数 (辅助函数，方便业务层直接使用)
-    int LoadInt(const std::string &key, int default_value = 0);
+    int LoadInt(const std::string &key, int default_value = 0) const;
 
 private:
     MprpcConfig() = default;
@@ -37,7 +37,7 @@ private:
     std::unordered_map<std::string, std::string> m_configMap;
     
     // 读写锁：虽然配置加载后通常只读，但为了严谨的线程安全，保留互斥锁
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
 
     // 内部工具：去掉字符串前后的空格
     void Trim(std::string &src_buf);
