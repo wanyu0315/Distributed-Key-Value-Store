@@ -120,3 +120,7 @@ CMake是从根目录的CMakeListes.txt文件一层一层链接下去的，因此
     这是含金量最高的。它没有启动真实的网络，而是直接操作内存中的 Buffer。
     通过 AppendInt8 和 AppendString 手动构造符合协议的二进制流。
     验证了 Peek 策略：在 test_partial_packet 中，测试故意只给 5 个字节，验证了代码不会错误地消费数据，而是等待数据补齐。这是对之前改进的 TryParseMessage 最有力的验证。
+
+# Attention！！
+    目前所有的RPC框架都已经替换为了单独开发的高性能RPC框架项目。
+    详细的测试内容在项目中，项目链接：[text](https://github.com/wanyu0315/MpRPC)
