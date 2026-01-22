@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package raftRpcProctoc;
+
+// ========== Raft 节点间通信协议 ==========
+
+// 投票请求
+message RequestVoteArgs {
+    int32 term = 1;              // 候选人的任期号
+    int32 candidateId = 2;       // 请求选票的候选人ID
+    int32 lastLogIndex = 3;      // 候选人最后日志条目的索引
+    int32 lastLogTerm = 4;       // 候选人最后日志条目的任期号
+}
+
+// 投票响应
+message RequestVoteReply {
+    int32 term = 1;              // 当前任期号，用于候选人更新自己
+    bool voteGranted = 2;        // 候选人是否赢得了选票
+}
+
+// 日志条目
+message LogEntry {
+    int32 term = 1;              // 日志条目的任期号
+    int32 index = 2;             // 日志条目的索引
+    bytes command = 3;           // 状态机指令（序列化后的Op）
+}
+
+// 日志复制/心跳请求
+message AppendEntriesArgs {
+    int32 term = 1;              // 领导人的任期号
+    int32 leaderId = 2;          // 领导人ID，便于follower重定向客户端
+    int32 prevLogIndex = 3;      // 新日志条目之前的日志条目索引
+    int32 prevLogTerm = 4;       // prevLogIndex处的日志条目任期号
+    repeated LogEntry entries = 5; // 需要存储的日志条目（心跳时为空）
+    int32 leaderCommit = 6;      // 领导人已提交的最高日志条目索引
+}
+
+// 日志复制/心跳响应
+message AppendEntriesReply {
+    int32 term = 1;              // 当前任期号，用于领导人更新自己
+    bool success = 2;            // 如果follower包含与prevLogIndex和prevLogTerm匹配的条目则为true
+    
+    // 快速回退优化（MIT 6.824优化）
+    int32 conflictTerm = 3;      // 冲突条目的任期号
+    int32 conflictIndex = 4;     // 该任期的第一条日志索引
+}
+
+// 快照数据块（用于流式传输大快照）
+message SnapshotChunk {
+    bytes data = 1;              // 快照数据片段
+    int32 offset = 2;            // 数据偏移量
+    bool done = 3;               // 是否是最后一块
+}
+
+// 安装快照请求
+message InstallSnapshotArgs {
+    int32 term = 1;              // 领导人的任期号
+    int32 leaderId = 2;          // 领导人ID
+    int32 lastIncludedIndex = 3; // 快照中包含的最后日志条目索引
+    int32 lastIncludedTerm = 4;  // 快照中包含的最后日志条目任期号
+    bytes data = 5;              // 快照数据（完整）
+    
+    // 如果快照太大，可以分块传输（可选扩展）
+    // int32 offset = 6;
+    // bool done = 7;
+}
+
+// 安装快照响应
+message InstallSnapshotReply {
+    int32 term = 1;              // 当前任期号
+}
+
+// ========== Raft RPC 服务定义 ==========
+service RaftRpcService {
+    // 请求投票
+    rpc RequestVote(RequestVoteArgs) returns (RequestVoteReply);
+    
+    // 追加日志/心跳
+    rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesReply);
+    
+    // 安装快照
+    rpc InstallSnapshot(InstallSnapshotArgs) returns (InstallSnapshotReply);
+    
+    // 流式快照传输（可选，用于大快照）
+    // rpc InstallSnapshotStream(stream SnapshotChunk) returns (InstallSnapshotReply);
+}

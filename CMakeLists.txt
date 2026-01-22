@@ -16,7 +16,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 5. 查找外部库或包
 find_package(Boost REQUIRED COMPONENTS serialization system)  #  使用 Boost 库的序列化和系统组件
 find_package(Threads REQUIRED) # 查找线程库 (pthread)
-find_package(Protobuf REQUIRED) # 查找 Protobuf 库
+find_package(Protobuf CONFIG REQUIRED)
+find_package(gRPC CONFIG REQUIRED)
+# gRPC 通常会自动拉取 Abseil，但有些环境需要显式查找
+find_package(absl CONFIG REQUIRED)
 
 # 6. 告诉CMake进入各个子目录
 add_subdirectory(proto)
