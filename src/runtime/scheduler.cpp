@@ -58,13 +58,13 @@ Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name)
         
         // 设置当前线程（主线程）的调度协程
         t_scheduler_fiber = Caller_Schedule_Fiber_.get(); // 把创建的调度协程指针存到线程局部变量里，t_scheduler_fiber就指向这个调度协程了
-        Schedule_Fiber_ThreadID = GetThreadId();
-        threadIds_.push_back(Schedule_Fiber_ThreadID);
+        rootThread_ = GetThreadId();
+        threadIds_.push_back(rootThread_);
     } else {
-        Schedule_Fiber_ThreadID = -1;
+        rootThread_ = -1;
     }
     threadCnt_ = threads;   // start()时，创建的线程池包含的线程数量
-    std::cout << LOG_HEAD << "Constructed: " << name_ << " success" << std::endl;
+    // std::cout << LOG_HEAD << "Constructed: " << name_ << " success" << std::endl;
 }
 
 /**
@@ -171,7 +171,7 @@ void Scheduler::stop() {
     if (Caller_Schedule_Fiber_) {
         if (!stopping()) {
             // 切入 Caller_Schedule_Fiber_ 执行 run()，直到满足 stopping() 条件
-            Caller_Schedule_Fiber_->resume();
+            Caller_Schedule_Fiber_->call(); // 使用 call 或 resume 均可，call 更语义化
         }
     }
 
@@ -207,7 +207,7 @@ void Scheduler::run() {
     setThis(); // 绑定当前线程的调度器为自己
     
     // 初始化 thread_local 的调度协程指针
-    if (GetThreadId() != Schedule_Fiber_ThreadID) {
+    if (GetThreadId() != rootThread_) {
         t_scheduler_fiber = Fiber::GetThis().get();
     }
 
@@ -308,12 +308,12 @@ void Scheduler::run() {
  * @brief 唤醒线程 (Tickle)
  * * 场景： 当有新任务加入，或者需要停止调度器时调用。
  * 细节：
- * 1. 作用于 idle() 中的 wait。
- * 2. 使用 notify_one 唤醒一个正在休眠的线程。
+ * 1. 在基类 Scheduler 中，由于不知道具体的唤醒机制（Condition Variable 还是 Pipe），
+ * 此处留空或仅打印日志。
+ * 2. 实际的唤醒逻辑由子类（如 IOManager）重写实现。
  */
 void Scheduler::tickle() { 
-    Mutex::Lock lock(mutex_);
-    tickleFds_.notify_one(); // 唤醒一个等待的线程
+    // std::cout << LOG_HEAD << "tickle (base)" << std::endl;
 }
 
 /**
@@ -336,8 +336,8 @@ bool Scheduler::stopping() {
  * * 场景： 当 run() 循环中没有任务可做时，切入此协程。
  * 细节：
  * 1. 这是一个死循环，只要调度器没停止，它就负责 "等待"。
- * 2. [关键改进] 使用 condition_variable 挂起线程，而不是忙等待 (yield loop)。
- * 这解决了 CPU 100% 占用的问题。
+ * 2. [注意] 基类 scheduler 不支持 epoll，只能通过 Yield 忙等待来模拟阻塞。
+ * 真正的 IOManager 会重写此方法，使用 epoll_wait 挂起线程。
  */
 void Scheduler::idle() {
     std::cout << LOG_HEAD << "Enter idle" << std::endl;
@@ -347,17 +347,8 @@ void Scheduler::idle() {
             break;
         }
         
-        // 挂起线程，直到被 tickle 或 停止
-        {
-            Mutex::Lock lock(mutex_);
-            // wait 此处会释放锁，并阻塞线程。
-            // 当被 notify 时，重新获取锁并检查条件。
-            tickleFds_.wait(lock, [this](){
-                return stopping_ || !tasks_.empty();
-            });
-        }
-        
-        // 醒来后，切回 run() 协程，让它去 tasks_ 队列里抢任务
+        // 由于移除了条件变量，基类只能通过 yield 让出 CPU 权限
+        // 子类 IOManager 会在此处使用 epoll_wait 真正阻塞线程
         Fiber::GetThis()->yield();
     }
 }

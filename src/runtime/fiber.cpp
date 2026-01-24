@@ -6,7 +6,7 @@
 #include <iostream>
 #include <unistd.h>     // for sysconf
 #include <sys/mman.h>   // for mmap, mprotect, munmap
-#include "scheduler.h" 
+#include "scheduler.h"  // 必须包含，用于访问 Scheduler::GetMainFiber()
 
 // 引入 Valgrind 头文件以支持内存分析
 #if __has_include(<valgrind/valgrind.h>)
@@ -129,6 +129,16 @@ uint64_t Fiber::TotalFiberNum() {
 }
 
 /**
+ * @brief 获取当前协程 ID
+ */
+uint64_t Fiber::GetCurFiberID() {
+    if (t_fiber) {
+        return t_fiber->getId();
+    }
+    return 0;
+}
+
+/**
  * @brief 协程入口函数 (Trampoline)
  * 用于封装用户回调，处理异常及生命周期
  * 当调度器切换到一个新协程时，CPU 实际上是从这个函数开始执行的。它的核心任务是“包裹”用户的业务逻辑。
@@ -208,7 +218,7 @@ Fiber::Fiber(std::function<void()> cb, size_t stacksize, bool run_inscheduler)
     // 4. 修改上下文
     ctx_.uc_link = nullptr;          // 执行完后不自动跳转，由 MainFunc 手动 yield
     ctx_.uc_stack.ss_sp = stack_ptr; // 设置栈顶
-    ctx_.uc_stack.ss_size = stackSize_; // 将指令指针(IP)指向 MainFunc
+    ctx_.uc_stack.ss_size = stackSize_; // 设置栈大小
 
     // 5. 绑定入口函数
     makecontext(&ctx_, &Fiber::MainFunc, 0);
@@ -219,6 +229,7 @@ Fiber::~Fiber() {
     // 如果有栈，说明是子协程
     if (stack_ptr) {
         // 子协程析构：确保状态为 TERM 或 EXCEPT (未执行完析构是危险的)
+        // 允许 READY 状态析构（针对刚创建但未执行就被销毁的任务）
         assert(state_ == TERM || state_ == EXCEPT || state_ == READY); 
 
         // 1. 从 Valgrind 注销 (Added Feature)
@@ -231,6 +242,7 @@ Fiber::~Fiber() {
         StackAllocator::Dealloc(stack_ptr, stackSize_);
     } else {
         // 主协程析构：确保当前协程就是自己 (逻辑正确性检查)
+        // 主协程没有回调函数 cb_
         assert(!cb_);
         assert(state_ == RUNNING);
         
@@ -249,7 +261,7 @@ Fiber::~Fiber() {
  * @brief 换入：激活当前协程，开始（或继续）执行。
  * * 逻辑分支：
  * 1. 如果该协程参与调度器调度 (isRunInScheduler_):
- * 与 调度器主协程 (Scheduler::GetMainFiber()) 交换上下文。
+ * 与 调度器调度协程 (Scheduler::GetMainFiber()) 交换上下文。
  * 2. 如果该协程是线程独立协程 (!isRunInScheduler_):
  * 与 线程主协程 (t_threadFiber) 交换上下文。
  */
@@ -259,12 +271,12 @@ void Fiber::resume() {
     state_ = RUNNING;
 
     if (isRunInScheduler_) {
-        // 核心：保存调度器的上下文，恢复本协程的上下文
+        // [核心适配]：与调度器主协程交换
         if (swapcontext(&(Scheduler::GetMainFiber()->ctx_), &ctx_) == -1) {
             assert(false && "swapcontext error (scheduler->fiber)");
         }
     } else {
-        // 保存线程主协程上下文，恢复本协程上下文
+        // [独立协程]：与线程主协程交换
         if (swapcontext(&(t_threadFiber->ctx_), &ctx_) == -1) {
             assert(false && "swapcontext error (thread->fiber)");
         }
@@ -274,32 +286,26 @@ void Fiber::resume() {
 /**
  * @brief 换出：挂起当前协程，让出 CPU 执行权。
  * * 逻辑分支：
- * 1. 参与调度器：切回 调度器主协程。
+ * 1. 参与调度器：切回 调度器调度协程。
  * 2. 独立协程：切回 线程主协程。
  */
 void Fiber::yield() {
+    // 协程必须在运行态或结束态才能 yield
     assert(state_ == RUNNING || state_ == TERM);
     
-    // 切出时，需要恢复当前线程的全局指针指向“调用者”
-    if (isRunInScheduler_) {
-        SetThis(Scheduler::GetMainFiber()); // 告诉系统：现在是调度器在掌管 CPU 了
-    } else {
-        SetThis(t_threadFiber.get());
-    }
-
     if (state_ != TERM && state_ != EXCEPT) {
         state_ = READY;     // 标记：我还没写完，只是“就绪”等待下次被叫
     }
 
     if (isRunInScheduler_) {
-        // 核心：保存本协程上下文，恢复调度器上下文
-        // 1. 把我现在的状态（&ctx_）冻结保存。
-        // 2. 把调度员的状态（Scheduler::ctx_）解冻加载。
-        // 这一行代码执行完，CPU 就瞬间“传送”回了 Scheduler::run() 的循环里。
+        // 切回调度协程，恢复调度器的执行权
+        SetThis(Scheduler::GetMainFiber()); 
         if (swapcontext(&ctx_, &(Scheduler::GetMainFiber()->ctx_)) == -1) {
             assert(false && "swapcontext error (fiber->scheduler)");
         }
     } else {
+        // 切回线程主协程
+        SetThis(t_threadFiber.get());
         if (swapcontext(&ctx_, &(t_threadFiber->ctx_)) == -1) {
             assert(false && "swapcontext error (fiber->thread)");
         }
