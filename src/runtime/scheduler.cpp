@@ -212,6 +212,7 @@ void Scheduler::run() {
     }
 
     // 创建 Idle 协程：当没有任务时，运行这个协程进行休眠
+    // 由于虚函数，且实际中只需要实例化 IOManager，因此实际执行的是 IOManager::idle
     Fiber::ptr idle_fiber(new Fiber(std::bind(&Scheduler::idle, this)));
     
     // 创建回调协程容器：用于执行 std::function 类型的任务
@@ -256,6 +257,7 @@ void Scheduler::run() {
             tickle_other_thread |= (it != tasks_.end());
         }
 
+        // 调用的字面上是 tickle()，但实际运行时，执行的是 IOManager::tickle()，通过 C++ 的 虚函数（Virtual Function） 机制实现的。
         if (tickle_other_thread) {
             tickle();
         }
@@ -297,7 +299,7 @@ void Scheduler::run() {
 
             // 切换到 idle 协程进行等待 (会挂起当前线程)
             ++idleThreadCnt_;
-            idle_fiber->resume();
+            idle_fiber->resume();   
             --idleThreadCnt_;
         }
     }
