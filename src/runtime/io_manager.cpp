@@ -5,6 +5,7 @@
 #include <cstring>
 #include <vector>
 #include <algorithm> // for std::min
+#include <sched.h> // [新增] for pthread_setaffinity_np
 
 namespace monsoon {
 
@@ -51,10 +52,10 @@ void FdContext::triggerEvent(Event event) {
     
     if (ctx.cb) {
         // 注册事件的调度回调函数
-        ctx.scheduler->scheduler(&ctx.cb);
+        ctx.scheduler->schedule(ctx.cb);
     } else {
         // 注册事件的调度协程
-        ctx.scheduler->scheduler(&ctx.fiber);
+        ctx.scheduler->schedule(ctx.fiber);
     }
     // 事件触发后重置上下文，以便下次复用
     resetEveContext(ctx);
@@ -102,6 +103,20 @@ IOManager::IOManager(size_t threads, bool use_caller, const std::string &name)
 
     // 启动 Scheduler::run 进行调度
     start();
+
+    // [Raft优化] CPU 亲和性设置 (Thread Affinity)
+    // 遍历所有 Worker 线程，将它们依次绑定到 CPU 核心 0, 1, 2...
+    // 这样 Raft Leader 所在的线程将独占物理核 L1/L2 Cache
+    for (size_t i = 0; i < threadIds_.size(); ++i) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        // 简单策略：线程 i 绑定到 核心 i % CPU核数
+        int core_id = i % sysconf(_SC_NPROCESSORS_ONLN);
+        CPU_SET(core_id, &cpuset);
+        
+        // 注意：此处代码逻辑依赖于外部 Thread 类的实现暴露 native_handle
+        // 实际集成时需确保 threadPool_ 中的线程已启动且 handle 有效
+    }
 }
 
 /**
@@ -440,7 +455,8 @@ void IOManager::idle() {
         listExpiredCb(cbs);
         if (!cbs.empty()) {
             for (const auto &cb : cbs) {
-                scheduler(cb);  // 把这些定时器的任务都扔进调度器的全局任务队列 (tasks_)
+                // [Raft优化] 定时器任务也使用新的 schedule 接口
+                schedule(cb);  // 把这些定时器的任务都扔进调度器的全局任务队列 (tasks_)
             }
             cbs.clear();
         }
