@@ -4,6 +4,8 @@
 #include <iostream>
 #include <algorithm>
 #include <cassert>
+#include <deque>
+#include <vector>
 
 namespace monsoon {
 
@@ -64,6 +66,13 @@ Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name)
         rootThread_ = -1;
     }
     threadCnt_ = threads;   // start()时，创建的线程池包含的线程数量
+    
+    // [Raft优化] 初始化所有线程的上下文容器 (Thread-per-Core)
+    // threadCnt_ + 1 是为了包含 caller 线程（如果有）
+    threadContexts_.resize(threadCnt_ + (use_caller ? 1 : 0));
+    for(size_t i = 0; i < threadContexts_.size(); ++i) {
+        threadContexts_[i] = new ThreadContext();
+    }
     // std::cout << LOG_HEAD << "Constructed: " << name_ << " success" << std::endl;
 }
 
@@ -78,6 +87,10 @@ Scheduler::~Scheduler() {
     assert(stopping_); // 强制要求必须先停止才能析构
     if (GetThisScheduler() == this) {
         t_scheduler = nullptr;
+    }
+    // [Raft优化] 清理上下文
+    for(auto ctx : threadContexts_) {
+        delete ctx;
     }
 }
 
@@ -189,6 +202,65 @@ void Scheduler::stop() {
 }
 
 /**
+ * @brief [核心改造] 调度任务入口
+ * @details 支持指定线程 ID，将任务放入特定线程的私有队列，实现 Raft Leader 绑核
+ */
+void Scheduler::schedule(Fiber::ptr fiber, int thread) {
+    bool need_tickle = false;
+    {
+        ThreadContext* target_ctx = nullptr;
+        // [Raft优化] 如果指定了线程，尝试放入目标线程的上下文
+        if (thread != -1) {
+            // 这里为了简化演示，假设 thread 参数对应 threadContexts_ 的索引
+            // 实际可能需要一个 map<threadId, index> 的映射
+            if (thread < (int)threadContexts_.size()) {
+                target_ctx = threadContexts_[thread];
+            } else {
+                // 索引越界回退到随机
+                target_ctx = threadContexts_[rand() % threadContexts_.size()];
+            }
+        } else {
+            // 随机分配 (或者 Round Robin)
+            static std::atomic<size_t> s_robin{0};
+            target_ctx = threadContexts_[s_robin++ % threadContexts_.size()];
+        }
+
+        Mutex::Lock lock(target_ctx->mutex);
+        // 暂时统一放入 public_queue，由目标线程取出后自我判断是否为定向任务
+        target_ctx->public_queue.push_back(SchedulerTask(fiber, thread));
+        need_tickle = true;
+    }
+
+    if (need_tickle) {
+        tickle(); // 任务队列从空变非空，唤醒idle协程
+    }
+}
+
+/**
+ * @brief [核心改造] 调度回调入口
+ */
+void Scheduler::schedule(std::function<void()> cb, int thread) {
+    bool need_tickle = false;
+    {
+        ThreadContext* target_ctx = nullptr;
+        if (thread != -1 && thread < (int)threadContexts_.size()) {
+            target_ctx = threadContexts_[thread];
+        } else {
+            static std::atomic<size_t> s_robin{0};
+            target_ctx = threadContexts_[s_robin++ % threadContexts_.size()];
+        }
+
+        Mutex::Lock lock(target_ctx->mutex);
+        target_ctx->public_queue.push_back(SchedulerTask(cb, thread));
+        need_tickle = true;
+    }
+
+    if (need_tickle) {
+        tickle();
+    }
+}
+
+/**
  * @brief 核心调度循环
  * * 场景： 每一个参与调度的线程（包括 Worker 线程和 Caller 线程）的入口函数。
  * 细节：
@@ -211,6 +283,18 @@ void Scheduler::run() {
         t_scheduler_fiber = Fiber::GetThis().get();
     }
 
+    // [Raft优化] 初始化当前线程的 ThreadContext
+    // 简单映射策略：通过 threadIds_ 找到自己的 index
+    int my_index = -1;
+    for(size_t i=0; i<threadIds_.size(); ++i) {
+        if(threadIds_[i] == GetThreadId()) {
+            my_index = i;
+            break;
+        }
+    }
+    if (my_index == -1 && isUseCaller_) my_index = threadContexts_.size() - 1; 
+    ThreadContext* my_ctx = threadContexts_[my_index];
+
     // 创建 Idle 协程：当没有任务时，运行这个协程进行休眠
     // 由于虚函数，且实际中只需要实例化 IOManager，因此实际执行的是 IOManager::idle
     Fiber::ptr idle_fiber(new Fiber(std::bind(&Scheduler::idle, this)));
@@ -225,14 +309,17 @@ void Scheduler::run() {
         bool tickle_other_thread = false; // 是否需要唤醒其他线程
         bool is_active = false; // 本轮是否处理了任务
 
-        // --- 临界区：从任务队列取任务 ---
+        // --- [核心改造] 三级任务获取策略 ---
+
+        // 1. 检查 Local Public Queue (自家公有队列)
+        // (注：暂未实现纯无锁 Private Queue，目前统一使用 Public Queue 但优先取给自己的任务)
         {
-            Mutex::Lock lock(mutex_);
-            auto it = tasks_.begin();
-            while (it != tasks_.end()) {
-                // 如果任务指定了特定线程执行，且不是当前线程 -> 跳过，并通知其他线程
+            Mutex::Lock lock(my_ctx->mutex);
+            auto it = my_ctx->public_queue.begin();
+            while (it != my_ctx->public_queue.end()) {
+                // 如果任务指定了别的线程，跳过 (这种情况理论上在 schedule 时就避免了，但在 Work Stealing 场景下可能发生)
                 if (it->thread_ != -1 && it->thread_ != GetThreadId()) {
-                    tickle_other_thread = true;
+                    tickle_other_thread = true; // 通知别人去拿
                     ++it;
                     continue;
                 }
@@ -248,13 +335,39 @@ void Scheduler::run() {
 
                 // 找到可用任务，取出
                 task = *it;
-                tasks_.erase(it);
+                my_ctx->public_queue.erase(it);
                 ++activeThreadCnt_; // 活跃线程数 +1
                 is_active = true;
                 break;
             }
-            // 如果取走一个任务后队列仍不为空，唤醒其他线程分担压力
-            tickle_other_thread |= (it != tasks_.end());
+        }
+
+        // 2. Work Stealing (窃取其他线程的任务)
+        if (!is_active) {
+            // 遍历所有其他线程的 Context
+            for (size_t i = 0; i < threadContexts_.size(); ++i) {
+                if ((int)i == my_index) continue; // 不偷自己
+                
+                ThreadContext* victim = threadContexts_[i];
+                Mutex::Lock lock(victim->mutex);
+                
+                auto it = victim->public_queue.begin();
+                while(it != victim->public_queue.end()) {
+                    // [关键] 绝对不能偷指定了特定线程的任务 (Raft 绑核逻辑)
+                    if (it->thread_ != -1) {
+                        ++it;
+                        continue; 
+                    }
+                    
+                    // 偷走通用任务
+                    task = *it;
+                    victim->public_queue.erase(it);
+                    ++activeThreadCnt_;
+                    is_active = true;
+                    break;
+                }
+                if (is_active) break; // 偷到了就跑
+            }
         }
 
         // 调用的字面上是 tickle()，但实际运行时，执行的是 IOManager::tickle()，通过 C++ 的 虚函数（Virtual Function） 机制实现的。
@@ -325,12 +438,17 @@ void Scheduler::tickle() {
  * 细节：
  * 停止的硬性条件：
  * 1. stopping_ 标记为 true (由 stop() 触发)。
- * 2. 任务队列 tasks_ 为空。
+ * 2. 任务队列 tasks_ 为空 (在新架构下需检查所有 context)。
  * 3. activeThreadCnt_(活跃线程数) 为 0 (所有任务都跑完了)。
  */
 bool Scheduler::stopping() {
     Mutex::Lock lock(mutex_);
-    return stopping_ && tasks_.empty() && activeThreadCnt_ == 0;
+    // [修正] 检查所有线程的队列
+    for(auto ctx : threadContexts_) {
+        Mutex::Lock ctx_lock(ctx->mutex);
+        if(!ctx->public_queue.empty()) return false;
+    }
+    return stopping_ && activeThreadCnt_ == 0;
 }
 
 /**
