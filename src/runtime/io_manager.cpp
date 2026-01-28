@@ -73,6 +73,7 @@ void FdContext::triggerEvent(Event event) {
  * 2. 创建用于通知调度协程的管道 (Pipe)，并注册到 Epoll 中。
  * 3. 预分配 Socket 上下文容器。
  * 4. 启动调度器。
+ * 5. [Raft优化] 根据传入的 core_offset 参数，设置线程亲和性 (CPU Affinity)。
  */
 IOManager::IOManager(size_t threads, bool use_caller, const std::string &name, int core_offset)
     : Scheduler(threads, use_caller, name) {
