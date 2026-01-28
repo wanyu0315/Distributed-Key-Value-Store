@@ -132,7 +132,7 @@ private:
         // [私有队列]：仅当前线程可访问，用于 Raft Leader 等核心逻辑 (无锁/极低开销)
         // 注意：.h 中定义结构，具体无锁逻辑依赖 run 方法实现
         // 这里为了简化实现，暂统一放在结构体中，逻辑上区分对待
-        // std::deque<SchedulerTask> private_queue; 
+        std::deque<SchedulerTask> private_queue; 
 
         // [公共队列]：允许被窃取 (Work Stealing)，需加锁
         std::deque<SchedulerTask> public_queue;

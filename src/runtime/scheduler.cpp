@@ -21,6 +21,10 @@ static thread_local Scheduler *t_scheduler = nullptr;
 // 作用：当子协程 yield 时，会切回这个协程（即 run 方法执行的上下文）
 static thread_local Fiber *t_scheduler_fiber = nullptr;
 
+// 线程局部的调度上下文指针 (void* 是为了解耦，实际指向 ThreadContext*)
+// 作用：用于 schedule 时快速判断是否是“本线程给本线程派活”
+static thread_local void* t_thread_ctx = nullptr;
+
 const std::string LOG_HEAD = "[scheduler] ";
 
 /**
@@ -208,9 +212,11 @@ void Scheduler::stop() {
 void Scheduler::schedule(Fiber::ptr fiber, int thread) {
     bool need_tickle = false;
     {
+        // 1. 确定目标上下文
         ThreadContext* target_ctx = nullptr;
         // [Raft优化] 如果指定了线程，尝试放入目标线程的上下文
         if (thread != -1) {
+            // 用户指定了 thread ID (例如 Raft Leader 指定 thread=0)
             // 这里为了简化演示，假设 thread 参数对应 threadContexts_ 的索引
             // 实际可能需要一个 map<threadId, index> 的映射
             if (thread < (int)threadContexts_.size()) {
@@ -220,17 +226,27 @@ void Scheduler::schedule(Fiber::ptr fiber, int thread) {
                 target_ctx = threadContexts_[rand() % threadContexts_.size()];
             }
         } else {
-            // 随机分配 (或者 Round Robin)
+            // 用户没指定 (thread == -1)，也就是普通任务
+            // 使用 Round-Robin (轮询) 算法选择一个线程
             static std::atomic<size_t> s_robin{0};
             target_ctx = threadContexts_[s_robin++ % threadContexts_.size()];
         }
 
-        Mutex::Lock lock(target_ctx->mutex);
-        // 暂时统一放入 public_queue，由目标线程取出后自我判断是否为定向任务
-        target_ctx->public_queue.push_back(SchedulerTask(fiber, thread));
-        need_tickle = true;
+        // [核心优化]：私有队列 (Private Queue) 判断
+        // 如果目标上下文就是当前线程的上下文，说明是“自己给自己派活” (例如 Raft 状态机连续步骤)
+        // 此时直接放入 private_queue，完全无锁，性能极高。
+        if (target_ctx == t_thread_ctx) {
+            target_ctx->private_queue.push_back(SchedulerTask(fiber, thread));
+            // 不需要 tickle，因为我自己就在运行中，下一次 run 循环开头就会处理
+        } else {
+            // 如果是给别的线程派活，必须加锁并放入自己线程的 public_queue，后续会被窃取
+            Mutex::Lock lock(target_ctx->mutex);
+            target_ctx->public_queue.push_back(SchedulerTask(fiber, thread));
+            need_tickle = true;
+        }
     }
 
+    // 任务放进去了，如果放入的是公共队列，需要唤醒可能沉睡的 Worker 线程。
     if (need_tickle) {
         tickle(); // 任务队列从空变非空，唤醒idle协程
     }
@@ -243,18 +259,27 @@ void Scheduler::schedule(std::function<void()> cb, int thread) {
     bool need_tickle = false;
     {
         ThreadContext* target_ctx = nullptr;
+        // [Raft优化] 如果指定了线程，尝试放入目标线程的上下文
         if (thread != -1 && thread < (int)threadContexts_.size()) {
             target_ctx = threadContexts_[thread];
         } else {
+            // 用户没指定 (thread == -1)，也就是普通任务
             static std::atomic<size_t> s_robin{0};
             target_ctx = threadContexts_[s_robin++ % threadContexts_.size()];
         }
 
-        Mutex::Lock lock(target_ctx->mutex);
-        target_ctx->public_queue.push_back(SchedulerTask(cb, thread));
-        need_tickle = true;
+        // [核心优化]：私有队列 (Private Queue) 判断
+        if (target_ctx == t_thread_ctx) {
+            target_ctx->private_queue.push_back(SchedulerTask(cb, thread));
+        } else {
+            // 如果是给别的线程派活，必须加锁并放入自己线程的 public_queue，后续会被窃取
+            Mutex::Lock lock(target_ctx->mutex);
+            target_ctx->public_queue.push_back(SchedulerTask(cb, thread));
+            need_tickle = true;
+        }
     }
 
+    // 任务放进去了，如果放入的是公共队列，需要唤醒可能沉睡的 Worker 线程。
     if (need_tickle) {
         tickle();
     }
@@ -269,6 +294,10 @@ void Scheduler::schedule(std::function<void()> cb, int thread) {
  * - 有任务 -> 执行任务 (resume)。
  * - 无任务 -> 执行 Idle 协程 (yield + wait)。
  * 3. 实现了对象复用：对于函数回调 (cb) 类型的任务，复用 cb_fiber，避免重复内存分配。
+ * 4. 使用三级任务获取策略：
+ *  - 私有队列 (Private Queue)：无锁，极速，优先级最高。
+ * - 本线程公共队列 (Local Public Queue)：加锁，次优先级。
+ * - 窃取其他线程任务 (Work Stealing)：加锁，最低优先级。
  */
 void Scheduler::run() {
     std::cout << LOG_HEAD << "Run begin in thread: " << GetThreadId() << std::endl;
@@ -295,6 +324,9 @@ void Scheduler::run() {
     if (my_index == -1 && isUseCaller_) my_index = threadContexts_.size() - 1; 
     ThreadContext* my_ctx = threadContexts_[my_index];
 
+    // [新增] 设置线程局部上下文，供 schedule 判断使用
+    t_thread_ctx = my_ctx;
+
     // 创建 Idle 协程：当没有任务时，运行这个协程进行休眠
     // 由于虚函数，且实际中只需要实例化 IOManager，因此实际执行的是 IOManager::idle
     Fiber::ptr idle_fiber(new Fiber(std::bind(&Scheduler::idle, this)));
@@ -311,8 +343,24 @@ void Scheduler::run() {
 
         // --- [核心改造] 三级任务获取策略 ---
 
-        // 1. 检查 Local Public Queue (自家公有队列)
-        // (注：暂未实现纯无锁 Private Queue，目前统一使用 Public Queue 但优先取给自己的任务)
+        // 1. [新增] 检查 Private Queue (私有队列)
+        // 无锁，极速，优先级最高。Raft 核心逻辑（如日志追加循环）将常驻于此。
+        {
+            if (!my_ctx->private_queue.empty()) {
+                task = my_ctx->private_queue.front();
+                my_ctx->private_queue.pop_front();
+                // 只要私有队列有活，就一直干，不用去管公共队列
+                // 这保证了核心逻辑的 CPU 亲和性和无锁执行
+                if (task.fiber_ || task.cb_) {
+                    ++activeThreadCnt_;
+                    is_active = true;
+                    // 跳转到执行部分，跳过后面的公共队列检查
+                    goto execute_task; 
+                }
+            }
+        }
+
+        // 2. 检查 Local Public Queue (自家公有队列)
         {
             Mutex::Lock lock(my_ctx->mutex);
             auto it = my_ctx->public_queue.begin();
@@ -342,7 +390,7 @@ void Scheduler::run() {
             }
         }
 
-        // 2. Work Stealing (窃取其他线程的任务)
+        // 3. Work Stealing (窃取其他线程的任务)
         if (!is_active) {
             // 遍历所有其他线程的 Context
             for (size_t i = 0; i < threadContexts_.size(); ++i) {
@@ -375,6 +423,8 @@ void Scheduler::run() {
             tickle();
         }
 
+    // [新增] 执行标签，供 private_queue 跳转使用
+    execute_task:
         // --- 使用这个任务（task）持有的协程执行任务逻辑 ---
         if (task.fiber_ && (task.fiber_->getState() != Fiber::TERM && task.fiber_->getState() != Fiber::EXCEPT)) {
             // Case 1: 这是一个协程任务 (Fiber)
