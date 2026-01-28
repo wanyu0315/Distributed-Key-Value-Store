@@ -82,11 +82,12 @@ class IOManager : public Scheduler, public TimerManager {
    * @param threads 线程池包含的线程数量
    * @param use_caller 是否将当前的调用线程（Caller Thread）纳入调度体系
    * @param name 调度器的名称，用于日志和调试
+   * @param core_offset CPU绑定偏移量，用于设置线程亲和性
    * * 细节：
    * 1. 初始化 Epoll 实例和 Tickle 管道。
    * 2. 启动调度器线程池。
    */
-  IOManager(size_t threads = 1, bool use_caller = true, const std::string &name = "IOManager");
+  IOManager(size_t threads = 1, bool use_caller = true, const std::string &name = "IOManager", int core_offset = 0);
 
   /**
    * @brief 析构函数
