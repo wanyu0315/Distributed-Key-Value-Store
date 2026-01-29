@@ -260,8 +260,8 @@ void TimerManager::listExpiredCb(std::vector<std::function<void()>> &cbs) {
  * 2. 只有当新插入的定时器排在最前面 (begin)，才需要唤醒 epoll_wait (OnTimerInsertedAtFront)。
  * 3. 使用 tickled_ 标志位防止频繁无效唤醒。
  */
-void TimerManager::addTimer(Timer::ptr val, RWMutexType::WriteLock &lock) {
-    auto it = timers_.insert(val).first;  // 向set<Timer::ptr, Timer::Comparator> timers_插入定时器并获取定时器的迭代器
+void TimerManager::addTimer(Timer::ptr timer, RWMutexType::WriteLock &lock) {
+    auto it = timers_.insert(timer).first;  // 向set<Timer::ptr, Timer::Comparator> timers_插入定时器并获取定时器的迭代器
     bool at_front = (it == timers_.begin()) && !tickled_; // 判断是否是最前面的定时器且未被触发过tickle_
     
     if (at_front) {
