@@ -53,9 +53,9 @@ class FdCtx : public std::enable_shared_from_this<FdCtx> {
   bool m_isClosed : 1;
   /// 文件句柄
   int m_fd;
-  /// 读超时时间毫秒
+  /// 读超时时间（毫秒）
   uint64_t m_recvTimeout;
-  /// 写超时时间毫秒
+  /// 写超时时间（毫秒）
   uint64_t m_sendTimeout;
 };
 // 文件句柄管理
