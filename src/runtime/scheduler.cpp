@@ -392,11 +392,16 @@ void Scheduler::run() {
 
         // 3. Work Stealing (窃取其他线程的任务)
         if (!is_active) {
-            // 遍历所有其他线程的 Context
+            size_t thread_ctx_count = threadContexts_.size();
+            // 从 (my_index + 1) 开始遍历，绕一圈回来
             for (size_t i = 0; i < threadContexts_.size(); ++i) {
+                // 计算要偷取目标线程的索引：(自己 + 1 + 偏移量) % 总数
+                size_t target_idx = (my_index + 1 + i) % thread_ctx_count;
                 if ((int)i == my_index) continue; // 不偷自己
                 
-                ThreadContext* victim = threadContexts_[i];
+                // 确定好要偷取线程的目标上下文
+                ThreadContext* victim = threadContexts_[target_idx];
+                // 加锁偷取
                 Mutex::Lock lock(victim->mutex);
                 
                 auto it = victim->public_queue.begin();
