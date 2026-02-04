@@ -35,8 +35,9 @@ public:
      * @param threads 线程数量
      * @param use_caller 是否将当前线程纳入调度
      * @param name 调度器名称
+     * @param core_offset CPU绑定偏移量，-1表示不绑定
      */
-    Scheduler(size_t threads = 1, bool use_caller = true, const std::string &name = "Scheduler");
+    Scheduler(size_t threads = 1, bool use_caller = true, const std::string &name = "Scheduler", int core_offset = -1);
     
     virtual ~Scheduler();
     
@@ -140,6 +141,9 @@ private:
     };
 
 protected:
+    // 保存 CPU 偏移量
+
+    int m_core_offset = -1; 
     // 线程池
     std::vector<Thread::ptr> threadPool_;
     

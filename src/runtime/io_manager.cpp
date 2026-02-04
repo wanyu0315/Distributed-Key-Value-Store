@@ -104,65 +104,67 @@ IOManager::IOManager(size_t threads, bool use_caller, const std::string &name, i
 
     // 启动 Scheduler::run 进行调度，会创建线程池并让每个工作线程运行调度循环
     start();
-
-    // =======================================================
-    // [Raft优化] CPU 亲和性设置 (Thread Affinity)
-    // =======================================================
     
-    // 获取当前系统的逻辑核心数
-    int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    // CPU 亲和性绑定放到了Thread类的实现中，在创建线程时就绑定好
+
+    // // =======================================================
+    // // [Raft优化] CPU 亲和性设置 (Thread Affinity)
+    // // =======================================================
     
-    // [策略配置]
-    // stride: 步长。设为 1 表示紧凑绑定 (0,1,2,3)
-    // 设为 2 表示隔核绑定 (0,2,4,6)，有助于避开超线程(HT)争抢 ALU 资源
-    // 对于计算密集型的 Raft Leader，建议 stride = 1 (独占物理核) 或根据具体 CPU 拓扑调整
-    int stride = 1; 
+    // // 获取当前系统的逻辑核心数
+    // int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    
+    // // [策略配置]
+    // // stride: 步长。设为 1 表示紧凑绑定 (0,1,2,3)
+    // // 设为 2 表示隔核绑定 (0,2,4,6)，有助于避开超线程(HT)争抢 ALU 资源
+    // // 对于计算密集型的 Raft Leader，建议 stride = 1 (独占物理核) 或根据具体 CPU 拓扑调整
+    // int stride = 1; 
 
-    // A. 绑定 Worker 线程池
-    {
-        Mutex::Lock lock(Scheduler::mutex_); // 保护 threadPool_
-        for (size_t i = 0; i < threadPool_.size(); ++i) {
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
+    // // A. 绑定 Worker 线程池
+    // {
+    //     Mutex::Lock lock(Scheduler::mutex_); // 保护 threadPool_
+    //     for (size_t i = 0; i < threadPool_.size(); ++i) {
+    //         cpu_set_t cpuset;
+    //         CPU_ZERO(&cpuset);
 
-            // 计算目标核心：(偏移量 + 索引 * 步长) % 总核数
-            // 举例：offset=0, stride=1 -> 0, 1, 2, 3
-            // 举例：offset=4, stride=1 -> 4, 5, 6, 7 (用于 IO 分离)
-            int core_id = (core_offset + i * stride) % num_cores;
-            CPU_SET(core_id, &cpuset);
+    //         // 计算目标核心：(偏移量 + 索引 * 步长) % 总核数
+    //         // 举例：offset=0, stride=1 -> 0, 1, 2, 3
+    //         // 举例：offset=4, stride=1 -> 4, 5, 6, 7 (用于 IO 分离)
+    //         int core_id = (core_offset + i * stride) % num_cores;
+    //         CPU_SET(core_id, &cpuset);
 
-            // [关键修复] 获取原生线程句柄并调用系统 API
-            // 假设你的 Thread 类封装了 pthread_t，并提供了 native_handle()
-            // 如果没有，你需要去 Thread 类里加一个 getId() 返回 pthread_t
-            pthread_t native_thread = threadPool_[i]->native_handle();
+    //         // [关键修复] 获取原生线程句柄并调用系统 API
+    //         // 假设你的 Thread 类封装了 pthread_t，并提供了 native_handle()
+    //         // 如果没有，你需要去 Thread 类里加一个 getId() 返回 pthread_t
+    //         pthread_t native_thread = threadPool_[i]->native_handle();
             
-            int rc = pthread_setaffinity_np(native_thread, sizeof(cpu_set_t), &cpuset);
-            if (rc != 0) {
-                std::cerr << "[WARNING] Bind worker_" << i << " to core " << core_id 
-                          << " failed: " << strerror(rc) << std::endl;
-            } else {
-                // std::cout << "[INFO] Bound worker_" << i << " to core " << core_id << std::endl;
-            }
-        }
-    }
+    //         int rc = pthread_setaffinity_np(native_thread, sizeof(cpu_set_t), &cpuset);
+    //         if (rc != 0) {
+    //             std::cerr << "[WARNING] Bind worker_" << i << " to core " << core_id 
+    //                       << " failed: " << strerror(rc) << std::endl;
+    //         } else {
+    //             // std::cout << "[INFO] Bound worker_" << i << " to core " << core_id << std::endl;
+    //         }
+    //     }
+    // }
 
-    // B. 绑定 Caller 线程 (如果当前线程也参与调度)
-    if (use_caller) {
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
+    // // B. 绑定 Caller 线程 (如果当前线程也参与调度)
+    // if (use_caller) {
+    //     cpu_set_t cpuset;
+    //     CPU_ZERO(&cpuset);
         
-        // 策略：Caller 线程通常承担 Main Loop 或 Accept 职责
-        // 将其绑定到 offset 之前的最后一个核，或者紧接着 Worker 的下一个核
-        // 这里简单策略：绑定到分配给 Worker 之后的下一个核，避免冲突
-        int core_id = (core_offset + threadPool_.size() * stride) % num_cores;
-        CPU_SET(core_id, &cpuset);
+    //     // 策略：Caller 线程通常承担 Main Loop 或 Accept 职责
+    //     // 将其绑定到 offset 之前的最后一个核，或者紧接着 Worker 的下一个核
+    //     // 这里简单策略：绑定到分配给 Worker 之后的下一个核，避免冲突
+    //     int core_id = (core_offset + threadPool_.size() * stride) % num_cores;
+    //     CPU_SET(core_id, &cpuset);
 
-        int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-        if (rc != 0) {
-             std::cerr << "[WARNING] Bind caller thread to core " << core_id 
-                       << " failed: " << strerror(rc) << std::endl;
-        }
-    }
+    //     int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    //     if (rc != 0) {
+    //          std::cerr << "[WARNING] Bind caller thread to core " << core_id 
+    //                    << " failed: " << strerror(rc) << std::endl;
+    //     }
+    // }
 }
 
 /**

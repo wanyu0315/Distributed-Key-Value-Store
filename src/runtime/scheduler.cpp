@@ -38,8 +38,8 @@ const std::string LOG_HEAD = "[scheduler] ";
  * 此时需要创建一个 rootFiber，作为当前线程的调度循环执行流。
  * 2. 初始化线程数、名称等基础配置。
  */
-Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name)
-    : name_(name) {
+Scheduler::Scheduler(size_t threads, bool use_caller, const std::string &name, int core_offset)
+    : name_(name), m_core_offset(core_offset) {
     assert(threads > 0);
 
     isUseCaller_ = use_caller;  // 是否将当前的调用线程（Caller Thread）纳入调度体系
@@ -140,14 +140,36 @@ void Scheduler::start() {
     
     assert(threadPool_.empty());
     threadPool_.resize(threadCnt_);
+
+    // 获取当前系统的物理核心数
+    int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
     
+    // 步长策略：默认为 1，紧凑绑定 (0,1,2,3)
+    // 如果是计算密集型且有超线程，可考虑设为 2 (0,2,4,6)
+    int stride = 1;
+
     for (size_t i = 0; i < threadCnt_; ++i) {
+        int cpu_id = -1;
+        
+        // 计算该线程应该绑定的 CPU ID
+        // 只有在 Scheduler 构造时指定了有效的 core_offset_ 才进行绑定
+        if (m_core_offset != -1 && num_cores > 0) {
+            // 公式：(起始偏移 + 索引 * 步长) % 总核数
+            cpu_id = (m_core_offset + i * stride) % num_cores;
+        }
+
         // 创建新线程，入口函数为 Scheduler::run
+        // 传递 cpu_id 给 Thread 构造函数，实现"出生即绑核"
         threadPool_[i].reset(new Thread(std::bind(&Scheduler::run, this), 
-                                        name_ + "_" + std::to_string(i)));
+                                        name_ + "_" + std::to_string(i),
+                                        cpu_id));
+
         threadIds_.push_back(threadPool_[i]->getId());
     }
-    std::cout << LOG_HEAD << "Start success, threads: " << threadCnt_ << std::endl;
+    
+    std::cout << LOG_HEAD << "Start success, threads: " << threadCnt_ 
+              << ", affinity_mode: " << (m_core_offset == -1 ? "NONE" : "THREAD_PER_CORE") 
+              << std::endl;
 }
 
 /**
