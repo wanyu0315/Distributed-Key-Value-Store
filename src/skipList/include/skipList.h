@@ -40,7 +40,7 @@ class Node {
 
   void set_value(V);
 
-  // Linear array to hold pointers to next node of different level
+  // 线性数组，保存不同层级的下一个节点指针
   Node<K, V> **forward;
 
   int node_level;
@@ -183,15 +183,16 @@ int SkipList<K, V>::insert_element_unlocked(const K key, const V value) {
   Node<K, V> *current = this->_header;
 
   // 2. update 数组
-  Node<K, V> *update[_max_level + 1];
+  Node<K, V> *update[_max_level + 1]; // 记录每层的前驱节点，注意这个每层，Node节点是有层高的，有n层就有n个指向自己的Node指针
   memset(update, 0, sizeof(Node<K, V> *) * (_max_level + 1));
 
   // 3. 从顶层向下查找插入位置
-  for (int i = _skip_list_level; i >= 0; i--) {
+  for (int i = _skip_list_level; i >= 0; i--) { // i 负责层高，从顶层开始找
+    // 在第 i 层不断向前移动，直到找到第一个大于等于 key 的节点，遇到层高小于 i 就 i-- 继续往下层找
       while (current->forward[i] != NULL && current->forward[i]->get_key() < key) {
           current = current->forward[i];
       }
-      update[i] = current; // 记录每层的前驱节点
+      update[i] = current; // 记录每层的前驱节点， update[i]表示新节点在第 i 层的“前驱节点”
   }
 
   current = current->forward[0];
@@ -232,7 +233,7 @@ int SkipList<K, V>::insert_element_unlocked(const K key, const V value) {
   }
 
   return 0;
-  }
+}
 
 template <typename K, typename V>
 int SkipList<K, V>::insert_element(const K& key, const V& value) {
@@ -587,11 +588,14 @@ void SkipList<K, V>::clear(Node<K, V> * /*unused*/) {
 }
 
 template <typename K, typename V>
+// 获取随机层高
+// 使用 std::mt19937（梅森旋转算法） 配合 thread_local 关键字，保证了每个线程拥有独立的随机数生成器
 int SkipList<K, V>::get_random_level() {
   static thread_local std::mt19937 generator(std::random_device{}());
   static thread_local std::uniform_int_distribution<int> distribution(0, 1);
 
-  int k = 1;
+  int k = 1; // 初始层高为 1
+  // 以 50% 概率增加层高
   while (distribution(generator) % 2) {
       k++;
   }
