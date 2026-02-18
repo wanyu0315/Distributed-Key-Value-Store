@@ -131,7 +131,7 @@ void Scheduler::setThis() {
  * 3. 将线程 ID 记录到 threadIds_ 数组中。
  */
 void Scheduler::start() {
-    Mutex::Lock lock(mutex_);
+    MutexType::Lock lock(mutex_);
     if (!stopping_) {
         // 已经启动，直接返回
         return;
@@ -217,7 +217,7 @@ void Scheduler::stop() {
     // 等待所有子线程执行完毕 (join)
     std::vector<Thread::ptr> threads;
     {
-        Mutex::Lock lock(mutex_);
+        MutexType::Lock lock(mutex_);
         threads.swap(threadPool_); // 把成员变量 threadPool_ 里的线程指针转移到局部变量 threads 中。为了尽快释放 mutex_ 锁。
     }
 
@@ -262,7 +262,7 @@ void Scheduler::schedule(Fiber::ptr fiber, int thread) {
             // 不需要 tickle，因为我自己就在运行中，下一次 run 循环开头就会处理
         } else {
             // 如果是给别的线程派活，必须加锁并放入自己线程的 public_queue，后续会被窃取
-            Mutex::Lock lock(target_ctx->mutex);
+            MutexType::Lock lock(target_ctx->mutex);
             target_ctx->public_queue.push_back(SchedulerTask(fiber, thread));
             need_tickle = true;
         }
@@ -295,7 +295,7 @@ void Scheduler::schedule(std::function<void()> cb, int thread) {
             target_ctx->private_queue.push_back(SchedulerTask(cb, thread));
         } else {
             // 如果是给别的线程派活，必须加锁并放入自己线程的 public_queue，后续会被窃取
-            Mutex::Lock lock(target_ctx->mutex);
+            MutexType::Lock lock(target_ctx->mutex);
             target_ctx->public_queue.push_back(SchedulerTask(cb, thread));
             need_tickle = true;
         }
@@ -384,7 +384,7 @@ void Scheduler::run() {
 
         // 2. 检查 Local Public Queue (自家公有队列)
         {
-            Mutex::Lock lock(my_ctx->mutex);
+            MutexType::Lock lock(my_ctx->mutex);
             auto it = my_ctx->public_queue.begin();
             while (it != my_ctx->public_queue.end()) {
                 // 如果任务指定了别的线程，跳过 (这种情况理论上在 schedule 时就避免了，但在 Work Stealing 场景下可能发生)
@@ -424,7 +424,7 @@ void Scheduler::run() {
                 // 确定好要偷取线程的目标上下文
                 ThreadContext* victim = threadContexts_[target_idx];
                 // 加锁偷取
-                Mutex::Lock lock(victim->mutex);
+                MutexType::Lock lock(victim->mutex);
                 
                 auto it = victim->public_queue.begin();
                 while(it != victim->public_queue.end()) {
@@ -519,10 +519,10 @@ void Scheduler::tickle() {
  * 3. activeThreadCnt_(活跃线程数) 为 0 (所有任务都跑完了)。
  */
 bool Scheduler::stopping() {
-    Mutex::Lock lock(mutex_);
-    // [修正] 检查所有线程的队列
+    MutexType::Lock lock(mutex_);
+    // 检查所有线程的队列
     for(auto ctx : threadContexts_) {
-        Mutex::Lock ctx_lock(ctx->mutex);
+        MutexType::Lock ctx_lock(ctx->mutex);
         if(!ctx->public_queue.empty()) return false;
     }
     return stopping_ && activeThreadCnt_ == 0;
