@@ -139,8 +139,6 @@ uint64_t Fiber::GetCurFiberID() {
     }
     return 0;
 }
-
-
 uint64_t GetFiberId() {
     return Fiber::GetCurFiberID();
 }
