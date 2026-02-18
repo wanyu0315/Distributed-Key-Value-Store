@@ -130,12 +130,19 @@ uint64_t Fiber::TotalFiberNum() {
 
 /**
  * @brief 获取当前协程 ID
+ * 1. Fiber 类的静态成员函数实现 (核心逻辑)
+ * 2. util.h 中声明的全局函数实现 (桥接)
  */
 uint64_t Fiber::GetCurFiberID() {
     if (t_fiber) {
         return t_fiber->getId();
     }
     return 0;
+}
+
+
+uint64_t GetFiberId() {
+    return Fiber::GetCurFiberID();
 }
 
 /**

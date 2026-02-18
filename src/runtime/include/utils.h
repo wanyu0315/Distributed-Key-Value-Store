@@ -34,7 +34,7 @@ inline pid_t GetThreadId() {
  * * 注意： 此处仅声明。具体实现需在 fiber.cpp 中，
  * 防止 util.h 与 fiber.h 产生循环依赖。
  */
-uint32_t GetFiberId();
+uint64_t GetFiberId();
 
 /**
  * @brief 获取系统启动至今的毫秒数
