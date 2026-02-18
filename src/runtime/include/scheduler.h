@@ -27,8 +27,8 @@ namespace monsoon {
  */
 class Scheduler {
 public:
-    typedef std::shared_ptr<Scheduler> ptr;
-    typedef Mutex MutexType;
+    typedef std::shared_ptr<Scheduler> ptr; // 调度器智能指针类型定义
+    typedef Spinlock MutexType; // 使用自旋锁保护公共队列
 
     /**
      * @brief 构造函数
