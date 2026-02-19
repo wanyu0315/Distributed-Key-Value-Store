@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package kv;
+
+// ========== KV 状态机与客户端通信协议 ==========
+
+// 错误码定义
+enum ErrorCode {
+    OK = 0;
+    ERR_NOT_LEADER = 1;      // 不是 Leader，拒绝写请求
+    ERR_KEY_NOT_FOUND = 2;   // Key 不存在
+    ERR_TIMEOUT = 3;         // 请求超时 (Raft 尚未达成共识)
+    ERR_INTERNAL = 4;        // 系统内部错误
+}
+
+// 统一的错误信息封装
+message Error {
+    ErrorCode code = 1;
+    string msg = 2;
+    uint32 leader_id = 3;    // 【关键】当返回 NOT_LEADER 时，告诉客户端真正的 Leader 是谁，方便客户端重定向
+}
+
+// 键值对结构 (用于 Scan 返回)
+message KVPair {
+    bytes key = 1;           // 工业级 KV 存储 Key 和 Value 都是 bytes，而不是 string
+    bytes value = 2;
+}
+
+// --- 1. Put (写入操作) ---
+message PutRequest {
+    bytes key = 1;
+    bytes value = 2;
+    
+    // 【分布式核心：幂等性校验】
+    uint64 client_id = 3;    // 客户端唯一标识 (可用 UUID 或雪花算法生成)
+    uint64 req_id = 4;       // 递增的请求序列号，防止网络抖动导致的重复提交
+}
+
+message PutResponse {
+    Error error = 1;
+}
+
+// --- 2. Get (读取操作) ---
+message GetRequest {
+    bytes key = 1;
+    // uint64 client_id = 2; // 纯读操作不改变状态机，通常不需要防重放 (除非实现线性一致性读 ReadIndex)
+}
+
+message GetResponse {
+    Error error = 1;
+    bytes value = 2;         // 仅当 error.code == OK 时有效
+}
+
+// --- 3. Delete (删除操作) ---
+message DeleteRequest {
+    bytes key = 1;
+    
+    uint64 client_id = 2;    // 删除也是写操作，必须防重放
+    uint64 req_id = 3;
+}
+
+message DeleteResponse {
+    Error error = 1;
+}
+
+// --- 4. Scan (范围查询：面试图数据库的核心武器) ---
+message ScanRequest {
+    bytes start_key = 1;     // 包含 start_key (闭区间)
+    bytes end_key = 2;       // 不包含 end_key (开区间)
+    uint32 limit = 3;        // 最大返回数量，防止把内存打爆 (防御性编程)
+}
+
+message ScanResponse {
+    Error error = 1;
+    repeated KVPair kvs = 2; // 返回的键值对列表
+    bool has_more = 3;       // 游标指示器：是否还有未扫描完的数据
+}
+
+// ========== 客户端 RPC 服务定义 ==========
+service KVStorageService {
+    // 单点写入
+    rpc Put(PutRequest) returns (PutResponse);
+    
+    // 单点读取
+    rpc Get(GetRequest) returns (GetResponse);
+    
+    // 单点删除
+    rpc Delete(DeleteRequest) returns (DeleteResponse);
+    
+    // 范围查询 (基于底层 SkipList 实现)
+    rpc Scan(ScanRequest) returns (ScanResponse);
+}
